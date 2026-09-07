@@ -1,0 +1,22 @@
+--- a/tpu_inference/models/common/model_loader.py
++++ b/tpu_inference/models/common/model_loader.py
+@@ -90,6 +90,8 @@
+     from tpu_inference.models.jax.qwen2_5_vl import \
+         Qwen2_5_VLForConditionalGeneration
+     from tpu_inference.models.jax.qwen3 import Qwen3ForCausalLM
++    from tpu_inference.models.jax.qwen4_exp.model import (  # fork: Qwen4Exp
++        Qwen4ExpForCausalLM, Qwen4ExpMTP)
+     _MODEL_REGISTRY["Llama4ForCausalLM"] = Llama4ForCausalLM
+     _MODEL_REGISTRY["DeepseekV3ForCausalLM"] = DeepseekV3ForCausalLM
+     _MODEL_REGISTRY["LlamaForCausalLM"] = LlamaForCausalLM
+@@ -97,6 +99,10 @@
+     _MODEL_REGISTRY["Qwen3ForCausalLM"] = Qwen3ForCausalLM
+     _MODEL_REGISTRY[
+         "Qwen2_5_VLForConditionalGeneration"] = Qwen2_5_VLForConditionalGeneration
++    _MODEL_REGISTRY["Qwen4ExpForCausalLM"] = Qwen4ExpForCausalLM  # fork
++    _MODEL_REGISTRY["Qwen4ExpForConditionalGeneration"] = (  # fork: text path
++        Qwen4ExpForCausalLM)
++    _MODEL_REGISTRY["Qwen4ExpMTP"] = Qwen4ExpMTP  # fork: draft model
+     _MODEL_REGISTRY["Eagle3LlamaForCausalLM"] = EagleLlama3ForCausalLM
+     _MODEL_REGISTRY["GptOssForCausalLM"] = GptOss
+     _MODEL_REGISTRY["Qwen2ForCausalLM"] = Qwen2ForCausalLM

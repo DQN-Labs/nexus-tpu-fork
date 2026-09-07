@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tpu-inference-qwen4exp"
+version = "0.1.0"
+description = "Qwen3.8-Flash-Next (Qwen4Exp) JAX/TPU overlay for vllm-project/tpu-inference"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "jax>=0.6.0",
+    "flax>=0.10.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+serve = ["tpu-inference"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tpu_inference*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.yapf]
+based_on_style = "google"

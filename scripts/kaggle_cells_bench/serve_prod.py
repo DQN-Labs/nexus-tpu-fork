@@ -1,0 +1,57 @@
+import json, os, subprocess, sys, time, urllib.request
+from pathlib import Path
+
+# Pinned quant contract for the production export: GPTQ INT4, group_size
+# 128, asymmetric (zeros kept), DescAct=False.
+QUANT = "gptq"
+MAX_MODEL_LEN = 32768
+MAX_NUM_SEQS = 16
+
+info = json.loads(Path("/kaggle/working/model_path.json").read_text())
+if not info.get("path"):
+    msg = "NO PATH FOUND - skipping serve (provide the GPTQ export, then rerun)."
+    print(msg)
+    Path("/kaggle/working/server_info.json").write_text(json.dumps(
+        {"healthy": False, "reason": "NO PATH FOUND"}))
+else:
+    model_path = info["path"]
+    log = open("/kaggle/working/vllm_server.log", "w")
+    env = dict(os.environ, TPU_BACKEND_TYPE="jax")
+    cmd = [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve",
+           model_path, "--quantization", QUANT,
+           "--tensor-parallel-size", "8", "--max-model-len", str(MAX_MODEL_LEN),
+           "--max-num-seqs", str(MAX_NUM_SEQS), "--port", "8000"]
+    print(" ".join(cmd), flush=True)
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
+    t0 = time.time()
+    healthy = False
+    for _ in range(240):
+        time.sleep(10)
+        try:
+            with urllib.request.urlopen("http://localhost:8000/health",
+                                        timeout=5) as r:
+                if r.status == 200:
+                    healthy = True
+                    break
+        except Exception:
+            pass
+        if proc.poll() is not None:
+            break
+    startup_s = time.time() - t0
+    print(f"healthy={healthy} startup_s={startup_s:.0f} "
+          f"returncode={proc.poll()}")
+    try:
+        log.flush()
+        tail = Path("/kaggle/working/vllm_server.log").read_text().splitlines()
+        print(f"--- vllm_server.log tail ({len(tail)} lines) ---")
+        for line in tail[-60:]:
+            print(line[:500])
+    except Exception as e:
+        tail = [f"<log unreadable: {e}>"]
+        print(tail[0])
+    Path("/kaggle/working/server_info.json").write_text(json.dumps(
+        {"startup_s": startup_s, "path": model_path, "quant": QUANT,
+         "max_model_len": MAX_MODEL_LEN, "healthy": healthy,
+         "returncode": proc.poll(), "server_log_tail": tail[-60:]}))
+    assert healthy, "FAIL: server did not become healthy (see tail above)"
+    print("SERVER UP")
