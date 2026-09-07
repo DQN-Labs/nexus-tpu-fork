@@ -93,11 +93,13 @@ def md_cell(src):
     return {'cell_type': 'markdown', 'source': src, 'metadata': {}}
 
 
-def build_notebook():
-    blob = build_blob()
-    setup = open(Path(__file__).parent / 'kaggle_cells' / 'setup.py').read()
-    setup = setup.replace('__BLOB__', blob)
+def build_notebook(code_source='git'):
     cells_dir = Path(__file__).parent / 'kaggle_cells'
+    if code_source == 'git':
+        setup = (cells_dir / 'setup_git.py').read_text()
+    else:
+        blob = build_blob()
+        setup = (cells_dir / 'setup.py').read_text().replace('__BLOB__', blob)
     cells = [md_cell((cells_dir / 'header.md').read_text()),
              code_cell(setup),
              code_cell((cells_dir / 'tpu_gate.py').read_text()),
@@ -113,8 +115,8 @@ def build_notebook():
         'nbformat_minor': 4, 'nbformat': 4, 'cells': cells})
 
 
-def cmd_push(_args):
-    text = build_notebook()
+def cmd_push(args):
+    text = build_notebook(getattr(args, 'code_source', 'git'))
     print(f'notebook chars: {len(text)}')
     req = {'id': KERNEL_ID, 'hasId': True, 'idNullable': KERNEL_ID,
            'slug': KERNEL_SLUG, 'hasSlug': True, 'slugNullable': KERNEL_SLUG,
@@ -177,6 +179,8 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('push')
+    p.add_argument('--code-source', default='git', choices=('git', 'blob'),
+                   help='fork delivery: git clone (default) or embedded zip')
     p.set_defaults(fn=cmd_push)
     p = sub.add_parser('poll')
     p.add_argument('--timeout', type=int, default=5400)
