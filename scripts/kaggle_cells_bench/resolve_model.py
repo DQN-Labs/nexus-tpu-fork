@@ -6,7 +6,7 @@ from pathlib import Path
 # The owner drops the GPTQ export wherever suits; this cell finds it.
 # Expected export: GPTQ INT4, group_size 128, asymmetric (zeros kept),
 # DescAct=False, plus tokenizer + config.json alongside the shards.
-MODEL_PATH = ""  # <-- owner override, e.g. "/kaggle/input/qwen38-gptq"
+MODEL_PATH = "/kaggle/input/models/ram2121/qwen3-8-flash-next-gptq-4bit/transformers/4bit/1"  # attached Kaggle model
 
 found, checked = None, []
 env_path = os.environ.get("NEXUS_MODEL_PATH", "").strip()

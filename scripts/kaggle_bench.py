@@ -99,6 +99,9 @@ def build_notebook(last_cell='sweep.py'):
 def cmd_push(args):
     text = build_notebook(getattr(args, 'last_cell', 'sweep.py'))
     print(f'notebook chars: {len(text)}')
+    # Attached data: the GPTQ export as a Kaggle model source. Present only
+    # for prod runs; harmless otherwise (bench/qualify cells ignore it).
+    model_src = ["ram2121/qwen3-8-flash-next-gptq-4bit/transformers/4bit/1"]
     req = {'id': KERNEL_ID, 'hasId': True, 'idNullable': KERNEL_ID,
            'slug': KERNEL_SLUG, 'hasSlug': True, 'slugNullable': KERNEL_SLUG,
            'text': text, 'hasText': True, 'textNullable': text,
@@ -114,7 +117,8 @@ def cmd_push(args):
            'enableInternetNullable': True,
            'kernelExecutionType': 'SaveAndRunAll',
            'hasKernelExecutionType': True,
-           'kernelExecutionTypeNullable': 'SaveAndRunAll'}
+           'kernelExecutionTypeNullable': 'SaveAndRunAll',
+           'modelDataSources': model_src, 'modelDataSourcesSetter': model_src}
     print(call_tool('save_notebook', {'request': req})[:500])
 
 
