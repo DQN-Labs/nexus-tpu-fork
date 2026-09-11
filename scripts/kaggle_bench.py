@@ -80,6 +80,10 @@ def build_notebook(last_cell='sweep.py'):
     if last_cell == 'prod':
         order = ['header_prod.md', 'setup_prod.py', 'resolve_model.py',
                  'serve_prod.py', 'prompts_guarded.py']
+    elif last_cell == 'fork':
+        order = ['header_fork.md', 'setup_prod.py', 'fork_apply.py',
+                 'resolve_model.py', 'inspect_ckpt.py', 'serve_prod.py',
+                 'prompts_guarded.py']
     else:
         header = 'header_prompts.md' if last_cell == 'prompts.py' else 'header.md'
         order = [header, 'setup.py', 'weights.py', 'serve.py', last_cell]
@@ -135,7 +139,7 @@ def list_files():
 def cmd_poll(args):
     deadline = time.time() + args.timeout
     mode = getattr(args, 'last_cell', 'sweep.py')
-    targets = ('prompts_results.json',) if mode in ('prompts.py', 'prod') \
+    targets = ('prompts_results.json',) if mode in ('prompts.py', 'prod', 'fork') \
         else ('sweep_results.json',)
     while time.time() < deadline:
         files = list_files()
@@ -152,7 +156,8 @@ def cmd_fetch(args):
     out.mkdir(parents=True, exist_ok=True)
     files = list_files()
     for name in ('sweep_results.json', 'prompts_results.json',
-                 'weight_choice.json', 'server_info.json'):
+                 'weight_choice.json', 'server_info.json', 'model_path.json',
+                 'fork_applied.json', 'inspect_results.json'):
         if name not in files:
             print(f'missing: {name}')
             continue
