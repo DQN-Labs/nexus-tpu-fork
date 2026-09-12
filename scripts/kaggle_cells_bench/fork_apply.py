@@ -18,6 +18,22 @@ else:
 sha = subprocess.check_output(
     ["git", "-C", str(DST), "rev-parse", "HEAD"], text=True).strip()
 print("fork commit:", sha)
+# Overlay install: our tree ships only the leaf package
+# (tpu_inference/models/jax/qwen4_exp) with no intermediate __init__.py, so
+# it is invisible next to the regular tpu_inference already installed in
+# site-packages (namespace portions do not merge into it). Copy the leaf
+# into the installed tree instead - same approach as
+# scripts/setup_kaggle_tpu_v5e.sh. Diagnosed 2026-09-09 from
+# "ModuleNotFoundError: No module named 'tpu_inference.models.jax.qwen4_exp'".
+import shutil
+import tpu_inference
+base = Path(tpu_inference.__file__).parent
+src = DST / "tpu_inference" / "models" / "jax" / "qwen4_exp"
+dst = base / "models" / "jax" / "qwen4_exp"
+print(f"overlay: {src} -> {dst}")
+shutil.copytree(src, dst, dirs_exist_ok=True)
+import importlib
+importlib.invalidate_caches()
 if str(DST) not in sys.path:
     sys.path.insert(0, str(DST))
 from tpu_inference.models.jax.qwen4_exp import register
