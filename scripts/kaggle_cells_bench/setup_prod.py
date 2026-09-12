@@ -17,7 +17,7 @@ def _importable(mod):
     import importlib.util
     return importlib.util.find_spec(mod) is not None
 
-PINNED = {"tpu-inference": "0.28.0", "vllm": "0.28.0", "torchaudio": "2.10.0",
+PINNED = {"tpu-inference": "0.29.0", "vllm": "0.28.0", "torchaudio": "2.10.0",
           "lark": "1.2.2"}
 VLLM_RUNTIME_DEPS = [
     "fastapi", "uvicorn", "openai", "pydantic", "tiktoken", "sentencepiece",
