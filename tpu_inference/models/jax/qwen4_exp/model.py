@@ -281,6 +281,10 @@ class Qwen4ExpMTP(JaxModule):
     Phase 1 provides a shape-correct stub sharing the target trunk config;
     full draft training/acceptance wiring follows the ``gemma4_mtp.py``
     pattern (tracked in docs as unsupported).
+
+    The ``__call__`` stub below satisfies the runner's model-interface
+    validator so registration succeeds on VMs where tpu-inference enforces it
+    (diagnosed 2026-09-09: MTP was rejected for missing call on 0.29.0).
     """
 
     def __init__(self, vllm_config, rng_key: jax.Array, mesh: Mesh) -> None:
@@ -288,6 +292,22 @@ class Qwen4ExpMTP(JaxModule):
         rng = nnx.Rngs(rng_key)
         self.mesh = mesh
         self.model = Qwen4ExpModel(vllm_config, rng, mesh, prefix="model")
+
+    def __call__(  # conformant stub; untrained draft, not yet dispatched
+        self,
+        kv_caches,
+        input_ids,
+        attention_metadata,
+        inputs_embeds=None,
+        intermediate_tensors=None,
+        is_first_rank: bool = True,
+        is_last_rank: bool = True,
+        **kwargs,
+    ):
+        raise NotImplementedError(
+            "Qwen4ExpMTP draft serving is still a stub (see docs/qwen4_exp.md). "
+            "Target-model serving and inspect do not need it."
+        )
 
 
 __all__ = ["Qwen4ExpForCausalLM", "Qwen4ExpMTP", "Qwen4ExpModel"]

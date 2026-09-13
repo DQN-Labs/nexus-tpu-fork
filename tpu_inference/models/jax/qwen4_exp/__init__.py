@@ -61,7 +61,16 @@ def register(register_model=None):
         register_model = _reg
     register_model("Qwen4ExpForCausalLM", Qwen4ExpForCausalLM)
     register_model("Qwen4ExpForConditionalGeneration", Qwen4ExpForCausalLM)
-    register_model("Qwen4ExpMTP", Qwen4ExpMTP)
+    # MTP is a draft-model arch only; the validator on newer tpu-inference
+    # requires a runner-conformant __call__, so skip at publish time if it
+    # would reject the stub. The inspect path (config + weight-loader) does
+    # not need serving.
+    try:
+        register_model("Qwen4ExpMTP", Qwen4ExpMTP)
+    except TypeError as e:
+        import warnings
+
+        warnings.warn(f"Skipping Qwen4ExpMTP registration: {e}")
     return {
         "Qwen4ExpForCausalLM": Qwen4ExpForCausalLM,
         "Qwen4ExpForConditionalGeneration": Qwen4ExpForCausalLM,
