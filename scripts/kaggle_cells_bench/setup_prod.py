@@ -18,7 +18,12 @@ def _importable(mod):
     return importlib.util.find_spec(mod) is not None
 
 PINNED = {"tpu-inference": "0.29.0", "vllm": "0.28.0", "torchaudio": "2.10.0",
-          "lark": "1.2.2"}
+          "lark": "1.2.2", "transformers": "latest"}
+PIP_PINNED = [("tpu-inference", "tpu-inference==0.29.0"),
+             ("vllm", "vllm==0.28.0"),
+             ("torchaudio", "torchaudio==2.10.0"),
+             ("lark", "lark==1.2.2"),
+             ("transformers", "transformers>=5.5.3")]
 VLLM_RUNTIME_DEPS = [
     "fastapi", "uvicorn", "openai", "pydantic", "tiktoken", "sentencepiece",
     "safetensors", "tokenizers", "einops", "cloudpickle", "msgspec", "pyzmq",
@@ -32,7 +37,7 @@ VLLM_RUNTIME_DEPS = [
     "outlines_core==0.2.14", "lm-format-enforcer==0.11.3", "xgrammar",
     "llguidance", "mistral_common", "depyf",
     "prometheus-fastapi-instrumentator",
-    "lark==1.2.2", "huggingface_hub>=1.27.0",
+    "huggingface_hub>=1.27.0",
 ]
 MODULE_DEPS = ["fastapi", "uvicorn", "openai", "pydantic", "tiktoken",
                "sentencepiece", "safetensors", "tokenizers", "einops",
@@ -52,10 +57,20 @@ def stage(name, cmd, timeout_s=1500):
     print(f"[{time.strftime('%H:%M:%S')}] DONE {name} in {dt:.0f}s", flush=True)
 
 problems = []
-for dist, want in PINNED.items():
-    have = _dist_version(dist)
-    if have != want:
-        problems.append(f"{dist}: have {have}, want {want}")
+for key, want in PIP_PINNED:
+    have = _dist_version(key)
+    if want == "latest":
+        if have is None:
+            problems.append(f"{key}: not installed")
+    elif "==" in want:
+        want_ver = want.split("==", 1)[1]
+        if have != want_ver:
+            problems.append(f"{key}: have {have}, want {want_ver}")
+    else:  # spec like ">=5.5.3"
+        from packaging import version as _V  # noqa
+        if have is None or _V.parse(have) < _V.parse(
+                "".join(ch for ch in want if ch not in "<>=") or "0"):
+            problems.append(f"{key}: have {have}, want {want}")
 for mod in MODULE_DEPS:
     if not _importable(mod):
         problems.append(f"module missing: {mod}")
@@ -64,8 +79,11 @@ if problems:
           f"see comments for why):", flush=True)
     for p in problems[:20]:
         print("  -", p, flush=True)
-    stage("tpu_inference", [PY, "-m", "pip", "install", "tpu-inference",
-                            "huggingface_hub", "requests"])
+    # transformers pin lives on the base line (must satisfy --no-deps vllm
+    # and prior tpu-inference installs); runtime deps + torchaudio follow.
+    stage("tpu_inference", [PY, "-m", "pip", "install",
+                            "tpu-inference==0.29.0", "transformers>=5.5.3",
+                            "huggingface_hub>=1.27.0", "requests"])
     stage("vllm_nodeps", [PY, "-m", "pip", "install", "--no-deps",
                           "vllm==0.28.0"])
     stage("vllm_runtime_deps", [PY, "-m", "pip", "install",
