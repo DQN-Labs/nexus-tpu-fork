@@ -17,9 +17,9 @@ def _importable(mod):
     import importlib.util
     return importlib.util.find_spec(mod) is not None
 
-PINNED = {"tpu-inference": "0.29.0", "vllm": "0.28.0", "torchaudio": "2.10.0",
+PINNED = {"tpu-inference": "0.28.0", "vllm": "0.28.0", "torchaudio": "2.10.0",
           "lark": "1.2.2", "transformers": "latest"}
-PIP_PINNED = [("tpu-inference", "tpu-inference==0.29.0"),
+PIP_PINNED = [("tpu-inference", "tpu-inference==0.28.0"),
              ("vllm", "vllm==0.28.0"),
              ("torchaudio", "torchaudio==2.10.0"),
              ("lark", "lark==1.2.2"),
@@ -82,7 +82,7 @@ if problems:
     # transformers pin lives on the base line (must satisfy --no-deps vllm
     # and prior tpu-inference installs); runtime deps + torchaudio follow.
     stage("tpu_inference", [PY, "-m", "pip", "install",
-                            "tpu-inference==0.29.0", "transformers>=5.5.3",
+                            "tpu-inference==0.28.0", "transformers>=5.5.3",
                             "huggingface_hub>=1.27.0", "requests"])
     stage("vllm_nodeps", [PY, "-m", "pip", "install", "--no-deps",
                           "vllm==0.28.0"])

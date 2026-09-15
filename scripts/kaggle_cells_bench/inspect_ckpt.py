@@ -56,6 +56,9 @@ else:
             stacked.append([n, st[0]])
         elif W.is_ignored_missing(m):
             ignored.append(n)
+        elif W.is_gptq_aux(m) or W.is_gdn_param(m):
+            # GPTQ shards + GDN A_log/dt_bias: real params without ".weight"
+            mapped.append([n, m])
         elif ".weight" in m or "weight" in n:
             mapped.append([n, m])
         else:

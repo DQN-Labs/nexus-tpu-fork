@@ -90,6 +90,7 @@ _QSA_SCALE_SUFFIXES = {
 
 def strip_mtp_prefix(name: str) -> str:
     """Apply MTP remaps (``mtp.py``): shared head → lm_head, etc."""
+    # Order matters: more specific first.
     name = name.replace("model.language_model.", "model.")
     name = re.sub(r"^language_model\.", "model.", name)
     name = re.sub(r"^model\.mtp\.", "mtp.", name)
@@ -144,6 +145,38 @@ def is_ignored_missing(name: str) -> bool:
     if "hyper_connection_mixer.block_inject_weight" in name:
         return True
     return any(name.endswith(s) for s in IGNORED_MISSING_SUFFIXES)
+
+
+# GPTQ auxiliary tensors live alongside each Linear weight (qweight/qzeros/scales/g_idx
+# per expert shard, plus per-channel scales for fused gate_up). They are not
+# separate JAX parameters — the loader dequantizes them into the single
+# float weight (see quant.py::dequantize_q4_packed) — so for coverage they
+# count as mapped, not unknown. Likewise GDN's A_log / dt_bias have no
+# ".weight" suffix but are real params (gdn.py).
+_GPTQ_SUFFIXES = (
+    ".qweight",
+    ".qzeros",
+    ".scales",
+    ".g_idx",
+    ".weight_scale",  # compressed-tensors alias
+    ".input_scale",
+)
+
+
+def is_gptq_aux(name: str) -> bool:
+    return any(name.endswith(s) for s in _GPTQ_SUFFIXES)
+
+
+_GDN_NOWEIGHT_PARAMS = (
+    ".A_log",
+    ".dt_bias",
+    ".A_log.weight",
+    ".dt_bias.weight",
+)
+
+
+def is_gdn_param(name: str) -> bool:
+    return any(name.endswith(s) for s in _GDN_NOWEIGHT_PARAMS)
 
 
 # JAX-side transpose/reshape hints consumed by StandardWeightLoader.
