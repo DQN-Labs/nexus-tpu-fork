@@ -66,10 +66,12 @@ for key, want in PIP_PINNED:
         want_ver = want.split("==", 1)[1]
         if have != want_ver:
             problems.append(f"{key}: have {have}, want {want_ver}")
-    else:  # spec like ">=5.5.3"
+    else:  # spec like "transformers>=5.5.3" (pkg name + constraint)
+        import re
         from packaging import version as _V  # noqa
-        if have is None or _V.parse(have) < _V.parse(
-                "".join(ch for ch in want if ch not in "<>=") or "0"):
+        _m = re.search(r"[<>=!~]+\s*([A-Za-z0-9_.\-+*]+)", want)
+        _want_ver = _m.group(1) if _m else "0"
+        if have is None or _V.parse(have) < _V.parse(_want_ver):
             problems.append(f"{key}: have {have}, want {want}")
 for mod in MODULE_DEPS:
     if not _importable(mod):
