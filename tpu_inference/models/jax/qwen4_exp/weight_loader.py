@@ -144,6 +144,12 @@ def is_ignored_missing(name: str) -> bool:
 
     if "hyper_connection_mixer.block_inject_weight" in name:
         return True
+    # MTP draft-model tensors (mtp.*): our MTP is a stub sharing the target
+    # trunk (model.py::Qwen4ExpMTP), so draft-only weights such as
+    # mtp.layers.N.mlp.experts.{down_proj,gate_up_proj} are never loaded.
+    # Diagnosed 2026-09-16 (v44 inspect: 2 of the 5 GAPS).
+    if name.startswith("mtp.") or ".mtp." in name:
+        return True
     return any(name.endswith(s) for s in IGNORED_MISSING_SUFFIXES)
 
 

@@ -60,6 +60,12 @@ IGNORED_MISSING_SUFFIXES = (
     "_v_scale",
     "_weight_scale",
     "_input_scale",
+    # PLE n-gram table metadata: derived at load (splitmix64 multipliers,
+    # per-head sizes/offsets computed in ngram.py), not loaded params.
+    # Diagnosed 2026-09-16 (v44 inspect: 3 of the 5 GAPS).
+    ".layer_multipliers",
+    ".ngram_heads_offsets",
+    ".ngram_heads_vocab_sizes",
 )
 
 

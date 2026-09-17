@@ -39,6 +39,36 @@ if str(DST) not in sys.path:
 from tpu_inference.models.jax.qwen4_exp import register
 reg = register()
 print("registered architectures:", sorted(reg))
+# Server-subprocess reach: vLLM's ModelConfig parses the checkpoint with
+# transformers BEFORE consulting any model registry, and stock transformers
+# (even 5.12.1) does not know model_type qwen4_exp (v44 died here). Install
+# our AutoConfig shim in-process, then drop a .pth so EVERY fresh interpreter
+# - notably the `vllm serve` subprocess - self-installs config + registry
+# before ModelConfig runs.
+from tpu_inference.models.jax.qwen4_exp.startup import install as _srv_install
+_reg2 = _srv_install()
+print("startup install ok:", sorted(_reg2) if _reg2 else "registry deferred")
+import sysconfig
+_purelib = Path(sysconfig.get_paths()["purelib"])
+_pth = _purelib / "qwen4exp_tpu_startup.pth"
+_pth.write_text("import tpu_inference.models.jax.qwen4_exp.startup\n")
+print("wrote", _pth)
+# In-process proof that transformers now parses a qwen4_exp checkpoint
+# (synthetic config.json; the real one is inspected in the next cells).
+import json as _json, tempfile as _tf
+with _tf.TemporaryDirectory() as _d:
+    Path(_d, "config.json").write_text(_json.dumps({
+        "model_type": "qwen4_exp",
+        "architectures": ["Qwen4ExpForCausalLM"],
+        "hidden_size": 2560, "num_hidden_layers": 48,
+        "text_config": {"model_type": "qwen4_exp", "hidden_size": 2560,
+                        "num_hidden_layers": 48, "hc_count": 4}}))
+    from transformers import AutoConfig as _AC
+    _c = _AC.from_pretrained(_d)
+    assert type(_c).__name__ == "Qwen4ExpConfig", type(_c).__name__
+    assert _c.architectures == ["Qwen4ExpForCausalLM"]
+    assert _c.text_config.hidden_size == 2560
+    print("AutoConfig parses qwen4_exp: OK")
 Path("/kaggle/working/fork_applied.json").write_text(__import__("json").dumps(
     {"commit": sha, "registered": sorted(reg)}))
 print("FORK APPLIED")

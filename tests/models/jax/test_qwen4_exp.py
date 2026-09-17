@@ -135,6 +135,16 @@ def test_weight_name_mapping():
     assert remapped.endswith("self_attn._k_scale")
     assert wl_mod.is_ignored_missing("model.layers.0.self_attn.qkv_proj.bias")
     assert not wl_mod.is_ignored_missing("model.layers.0.self_attn.qkv_proj.weight")
+    # v44 leftovers (5 GAPS): PLE table metadata is derived at load, MTP
+    # draft tensors are never loaded (stub shares the target trunk).
+    assert wl_mod.is_ignored_missing(
+        "model.layers.1.ple.ple_embedding.layer_multipliers")
+    assert wl_mod.is_ignored_missing(
+        "model.layers.1.ple.ple_embedding.ngram_heads_offsets")
+    assert wl_mod.is_ignored_missing(
+        "model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes")
+    assert wl_mod.is_ignored_missing("mtp.layers.0.mlp.experts.down_proj")
+    assert wl_mod.is_ignored_missing("mtp.layers.0.mlp.experts.gate_up_proj")
 
 
 @requires_impl
@@ -467,6 +477,34 @@ def test_q4_dequant_roundtrip():
     w = quant_mod.dequantize_q4_packed(
         packed, scale, zero=jnp.full((2,), 8.0), dtype=jnp.float32)
     np.testing.assert_allclose(np.asarray(w), np.asarray(w_true), atol=0.6)
+
+
+@requires_impl
+def test_hf_config_autoconfig_parses_qwen4_exp(tmp_path):
+    """v44: stock transformers rejects model_type qwen4_exp, killing the
+    vLLM server in ModelConfig. Our shim must make AutoConfig parse it."""
+    import json
+
+    transformers = pytest.importorskip("transformers")
+    from tpu_inference.models.jax.qwen4_exp import hf_config as hf_mod
+
+    hf_mod.install_hf_config()
+    hf_mod.install_hf_config()  # idempotent
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "qwen4_exp",
+        "architectures": ["Qwen4ExpForCausalLM"],
+        "hidden_size": 2560, "num_hidden_layers": 48,
+        "vocab_size": 248320, "hc_count": 4,
+        "text_config": {"model_type": "qwen4_exp", "hidden_size": 2560,
+                        "num_hidden_layers": 48, "hc_count": 4,
+                        "indexer_n_heads": 8},
+    }))
+    cfg = transformers.AutoConfig.from_pretrained(str(tmp_path))
+    assert type(cfg).__name__ == "Qwen4ExpConfig"
+    assert cfg.architectures == ["Qwen4ExpForCausalLM"]
+    assert cfg.text_config.hidden_size == 2560
+    assert cfg.text_config.hc_count == 4  # extras preserved
+    assert cfg.text_config.indexer_n_heads == 8
 
 
 @pytest.mark.skipif(os.environ.get("QWEN4EXP_E2E") != "1",
