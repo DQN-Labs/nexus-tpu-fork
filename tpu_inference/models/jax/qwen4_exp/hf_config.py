@@ -74,14 +74,20 @@ def _build_config_classes() -> tuple[Any, Any]:
         model_type = MODEL_TYPE
 
         def __init__(self, text_config: Any = None, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
             if isinstance(text_config, dict):
                 text_config = Qwen4ExpTextConfig(**text_config)
+            # Set BEFORE super().__init__: transformers>=5.12 dataclass-validates
+            # inside __init__ (validate_token_ids -> get_text_config), so the
+            # attribute must already exist (v46 died here).
             self.text_config = text_config
+            super().__init__(**kwargs)
 
         def get_text_config(self, *args: Any, **kwargs: Any) -> Any:
-            if self.text_config is not None:
-                return self.text_config
+            # __dict__ lookup: recursion-proof against the custom
+            # __getattribute__ transformers>=5.12 installs on configs.
+            tc = self.__dict__.get("text_config", None)
+            if tc is not None:
+                return tc
             return super().get_text_config(*args, **kwargs)
 
     _BUILT = (Qwen4ExpTextConfig, Qwen4ExpConfig)
