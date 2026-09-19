@@ -103,9 +103,11 @@ def build_notebook(last_cell='sweep.py'):
 def cmd_push(args):
     text = build_notebook(getattr(args, 'last_cell', 'sweep.py'))
     print(f'notebook chars: {len(text)}')
-    # Attached data: the GPTQ export as a Kaggle model source. Present only
-    # for prod runs; harmless otherwise (bench/qualify cells ignore it).
-    model_src = ["ram2121/qwen3-8-flash-next-gptq-4bit/transformers/4bit/1"]
+    # Attached data: the NVFP4 export (primary) + GPTQ export (fallback)
+    # as Kaggle model sources. Present only for prod runs; harmless
+    # otherwise (bench/qualify cells ignore them).
+    model_src = ["keithtyser/qwen3-8-flash-next-nvfp4/pytorch/radixark-modelopt-fp4/1",
+                 "ram2121/qwen3-8-flash-next-gptq-4bit/transformers/4bit/1"]
     req = {'id': KERNEL_ID, 'hasId': True, 'idNullable': KERNEL_ID,
            'slug': KERNEL_SLUG, 'hasSlug': True, 'slugNullable': KERNEL_SLUG,
            'text': text, 'hasText': True, 'textNullable': text,
