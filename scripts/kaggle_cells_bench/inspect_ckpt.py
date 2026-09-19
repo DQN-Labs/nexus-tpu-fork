@@ -99,6 +99,47 @@ else:
         hist[key] = hist.get(key, 0) + 1
     rep["histogram"] = dict(sorted(hist.items()))
     print(f"histogram groups: {len(hist)}")
+    # Per-group shape/dtype (first occurrence; headers only, no values).
+    # This is what sizes the loader's fusions (qkv gate rows, expert dims,
+    # table shards, mixer rows) without moving 100+ GB.
+    try:
+        import struct as _st
+        if idx.exists():
+            _wmap = json.loads(idx.read_text())["weight_map"]
+            _paths = sorted({mp / _f for _f in _wmap.values()})
+        else:
+            _paths = sorted(mp.glob("*.safetensors"))
+        shapes = {}
+        for _shard in _paths:
+            try:
+                with open(str(_shard), "rb") as _fh:
+                    _n = _st.unpack("<Q", _fh.read(8))[0]
+                    _header = json.loads(_fh.read(_n))
+                for _k, _info in _header.items():
+                    if _k == "__metadata__":
+                        continue
+                    # RAW names (same keying as histogram above, no mapping).
+                    _parts = _k.split(".")
+                    _scope, _rest = "top", _parts
+                    for _i, _p in enumerate(_parts):
+                        if _p == "layers" and _i + 1 < len(_parts):
+                            _scope = "layers.#"
+                            _rest = _parts[_i + 2:]
+                            break
+                    _kind = _rest[-1] if _rest else "?"
+                    _mod = ".".join(_rest[:-1]) if len(_rest) > 1 else "(root)"
+                    _mod = _re.sub(r"\.\d+\.", ".#.", "." + _mod + ".").strip(".")
+                    _gk = f"{_scope} | {_mod} | {_kind}"
+                    if _gk not in shapes:
+                        shapes[_gk] = [_info.get("shape"), _info.get("dtype")]
+            except Exception as _e:
+                print(f"shape scan skipped {_shard.name}: {_e}")
+                continue
+        rep["hist_shapes"] = dict(sorted(shapes.items()))
+        print(f"hist_shapes groups: {len(shapes)}")
+    except Exception as _e:
+        rep["hist_shapes"] = {"error": str(_e)[:300]}
+        print(f"hist_shapes failed: {_e}")
     # quantization_config echo (what the loader bypass neutralizes).
     rep["quantization_config"] = cfg.get("quantization_config",
                                          text.get("quantization_config", None))

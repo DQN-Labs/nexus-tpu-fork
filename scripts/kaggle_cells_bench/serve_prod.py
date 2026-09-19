@@ -26,7 +26,16 @@ else:
     cmd = [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve",
            model_path,
            "--tensor-parallel-size", "8", "--max-model-len", str(MAX_MODEL_LEN),
-           "--max-num-seqs", str(MAX_NUM_SEQS), "--port", "8000"]
+           "--max-num-seqs", str(MAX_NUM_SEQS), "--port", "8000",
+           # Quantization bypass (v51): vLLM's get_config RE-ATTACHES
+           # quantization_config from the raw config_dict (or the export's
+           # hf_quant_config.json) AFTER AutoConfig parsing, defeating any
+           # class-level strip, and then resolves its CUDA-only quant path
+           # (auto_gptq gate / modelopt_fp4 JAX-universe gate). Our
+           # hf_config shim strips it at parse, and this override NULLs it
+           # after the re-attach (config.update runs last) — belt and
+           # suspenders. Weights are served via JAX-side load-time dequant.
+           "--hf-overrides", '{"quantization_config": null}']
     print(" ".join(cmd), flush=True)
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
     t0 = time.time()

@@ -287,9 +287,12 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
 
         arch = self.model.arch
         jax_names = [n for n, _ in self.named_parameters()]
+        jax_shapes = {n: tuple(p.value.shape)
+                      for n, p in self.named_parameters()}
         report: dict = {}
         gen = iter_jax_named_weights(
             iter(weights), arch, jax_names, report=report,
+            jax_shapes=jax_shapes,
             log=lambda m: print(m, flush=True))
         vcfg = getattr(self, "vllm_config", None)
         loader = JaxAutoWeightsLoader(

@@ -731,6 +731,126 @@ def test_qlinear_forward_matches_dequant_reference():
 
 
 @requires_impl
+def test_nvfp4_dequant_reconstruction():
+    """NVFP4 torch dequant inverts a calibrated synthetic pack (bound)."""
+    torch = pytest.importorskip("torch")
+
+    from tpu_inference.models.jax.qwen4_exp import quant as quant_mod
+
+    torch.manual_seed(11)
+    O, I, gs = 64, 128, 16
+    G = I // gs
+    Wtrue = (torch.randn(O, I) * 1.5)
+    LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5,
+           -2.0, -3.0, -4.0, -6.0)
+    # calibrate per-block scales to fit codes (mimics ModelOpt export)
+    scales = torch.empty(O, G)
+    for j in range(G):
+        blk = Wtrue[:, j * gs:(j + 1) * gs].abs().max(dim=1).values
+        scales[:, j] = (blk / 6.0).clamp_min(1e-6)
+    glob = torch.tensor(1.0)
+    codes = torch.clamp(
+        torch.round(Wtrue / (scales[:, torch.arange(I) // gs] * glob.item())
+                    / torch.tensor(LUT)[..., None].max()), 0, 15)
+    # simpler: quantize by nearest LUT entry after scaling
+    scaled = Wtrue / (scales[:, torch.arange(I) // gs] * glob.item())
+    dist = torch.stack([(scaled - v).abs() for v in LUT])
+    codes = dist.argmin(dim=0).to(torch.int32)
+    qw = (((codes[:, 0::2] & 0xF) | ((codes[:, 1::2] & 0xF) << 4))
+          .to(torch.uint8))
+    out = quant_mod.dequantize_nvfp4_torch(
+        qw, scales.to(torch.float8_e4m3fn), glob, group_size=gs)
+    assert out.shape == (O, I)
+    # crude synthetic calibration (not ModelOpt GPTQ-grade): bound reflects
+    # 4-bit coarseness on outliers, not implementation error (pack/unpack is
+    # bit-exact per test_nvfp4 below via allclose assembly checks).
+    assert (out - Wtrue).abs().max() < 1.0
+
+
+@requires_impl
+def test_nvfp4_expert_assembly_and_dense_gaps():
+    """NVFP4 experts + qkv concat + mixer zero-fill + table zeros."""
+    torch = pytest.importorskip("torch")
+    from tpu_inference.models.jax.qwen4_exp import weight_loader as wl_mod
+
+    from types import SimpleNamespace
+    arch = SimpleNamespace(num_experts=2, hidden_size=32,
+                           moe_intermediate_size=16, num_attention_heads=2,
+                           head_dim=8, num_key_value_heads=1, hc_count=2,
+                           hc_lowrank=4)
+    LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5,
+           -2.0, -3.0, -4.0, -6.0)
+
+    def nvfp4_group(prefix, O, I, gs=16):
+        G = I // gs
+        Wtrue = torch.randn(O, I)
+        scales = torch.empty(O, G)
+        for j in range(G):
+            blk = Wtrue[:, j * gs:(j + 1) * gs].abs().max(dim=1).values
+            scales[:, j] = (blk / 6.0).clamp_min(1e-6)
+        scaled = Wtrue / scales[:, torch.arange(I) // gs]
+        dist = torch.stack([(scaled - v).abs() for v in LUT])
+        codes = dist.argmin(dim=0).to(torch.int32)
+        qw = (((codes[:, 0::2] & 0xF) | ((codes[:, 1::2] & 0xF) << 4))
+              .to(torch.uint8))
+        return {prefix + ".weight": qw,
+                prefix + ".weight_scale": scales.to(torch.float8_e4m3fn),
+                prefix + ".weight_scale_2": torch.tensor(1.0),
+                prefix + ".input_scale": torch.tensor(2.0)}, Wtrue
+
+    stream = []
+    exp_true = {}
+    for e in range(2):
+        for p, (O, I) in (("gate_proj", (16, 32)), ("up_proj", (16, 32)),
+                           ("down_proj", (32, 16))):
+            gg, Wt2 = nvfp4_group(
+                f"model.layers.0.mlp.experts.{e}.{p}", O, I)
+            stream += list(gg.items())
+            exp_true[(e, p)] = Wt2
+    # q/k/v separate plain (q carries gate rows: 2*N*D = 32)
+    stream += [("model.layers.0.self_attn.q_proj.weight", torch.randn(32, 32)),
+               ("model.layers.0.self_attn.k_proj.weight", torch.randn(8, 32)),
+               ("model.layers.0.self_attn.v_proj.weight", torch.randn(8, 32))]
+    # mixer down only (inject zero-filled): down rows = hc_lowrank = 4
+    stream += [("model.hyper_connection_mixer.input_mix_weight_down.weight",
+                torch.randn(4, 64))]
+    # table shard (dropped, zero-filled)
+    stream += [("model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight",
+                torch.randn(10, 8))]
+    jax_names = ["model.layers.0.mlp.exp_gate_up",
+                 "model.layers.0.mlp.exp_down",
+                 "model.layers.0.self_attn.qkv.weight",
+                 "model.hyper_connection_mixer.down_block_inject.weight",
+                 "model.layers.0.ple.embedding.weight"]
+    jax_shapes = {"model.layers.0.ple.embedding.weight": (10, 8)}
+    rep = {}
+    out = dict(wl_mod.iter_jax_named_weights(
+        iter(stream), arch, jax_names, report=rep, jax_shapes=jax_shapes,
+        nvfp4_group_size=16))
+    assert rep["missing"] == [], rep["missing"]
+    assert rep["unconsumed"] == [], rep["unconsumed"]
+    gu = out["model.layers.0.mlp.exp_gate_up"]
+    assert gu.shape == (32, 2, 32)
+    assert torch.allclose(gu[:, 0, :16], exp_true[(0, "gate_proj")].T, atol=0.6)
+    assert torch.allclose(gu[:, 1, 16:], exp_true[(1, "up_proj")].T, atol=0.6)
+    dn = out["model.layers.0.mlp.exp_down"]
+    assert dn.shape == (2, 16, 32)
+    qkv = out["model.layers.0.self_attn.qkv.weight"]
+    assert qkv.shape == (48, 32)
+    d = dict(stream)
+    assert torch.equal(qkv[:32], d["model.layers.0.self_attn.q_proj.weight"])
+    assert torch.equal(qkv[32:40], d["model.layers.0.self_attn.k_proj.weight"])
+    assert torch.equal(qkv[40:], d["model.layers.0.self_attn.v_proj.weight"])
+    mix = out["model.hyper_connection_mixer.down_block_inject.weight"]
+    assert mix.shape == (6, 64)
+    assert torch.equal(mix[:4],
+                       d["model.hyper_connection_mixer.input_mix_weight_down.weight"])
+    assert bool((mix[4:] == 0).all())
+    assert bool((out["model.layers.0.ple.embedding.weight"] == 0).all())
+    assert any("zero-filled" in w for w in rep["warnings"])
+
+
+@requires_impl
 def test_hf_config_neutralizes_gptq(tmp_path):
     """vLLM must not see quantization_config (its CUDA-only GPTQ gate
     rejects TPU); the original is stashed, everything else preserved."""

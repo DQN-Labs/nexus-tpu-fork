@@ -262,7 +262,8 @@ _NORM_CANDIDATES = (
     ("norm_conv_w", (".norm_conv.weight", ".conv_norm.weight",
                      ".norm_conv_w", ".ple_norm_conv.weight")),
     ("norm_w", (".norm.weight", ".norm_w", ".rms_norm.weight")),
-    ("conv_w", (".conv_w", ".conv.weight", ".depthwise_conv.weight")),
+    ("conv_w", (".conv_w", ".conv1d.weight", ".conv.weight",
+                ".depthwise_conv.weight")),
     ("conv_weight", (".conv_weight", ".conv.weight",
                      ".causal_conv.weight", ".conv_weight.weight")),
 )
@@ -280,6 +281,10 @@ _HC_PREFIX_CANDIDATES = (
 # single JAX param (ckpt shard suffix -> position). Mirrors STACKED_MAP but
 # operates on dequantized/plain torch tensors at load time.
 _CONCAT_GROUPS = {
+    # fused JAX qkv [2q+2kv, H] from separate q/k/v rows. The q shard must
+    # carry gate rows too (2*N*D, validated at flush); order is q,k,v.
+    "self_attn.qkv": (("self_attn.q_proj", "self_attn.k_proj",
+                       "self_attn.v_proj"), 0),
     # merged PLE kv [E, 5H] from key+value rows (JAX attr ``kv``, see ngram.py)
     "ple.kv": (("ple.key_proj", "ple.value_proj"), 0),
     # merged GDN in_proj_qkvz from qkv+z rows
@@ -406,8 +411,22 @@ def _maybe_bf16(jax_name, tensor):
     return tensor
 
 
+# NVFP4 (ModelOpt) per-tensor kinds next to each expert/linear prefix.
+_NVFP4_KINDS = ("weight_scale", "weight_scale_2", "input_scale")
+
+
+def _is_table_tensor(mapped):
+    """PLE n-gram table pieces (102 GB; host-side in phase 2, skipped here).
+
+    Matches pre- or post-rename (map_checkpoint_name rewrites
+    ple_embedding -> embedding), so key on ngram_embedding only.
+    """
+    return "ngram_embedding" in mapped
+
+
 def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
-                           bits=4, group_size=128, log=None):
+                           bits=4, group_size=128, nvfp4_group_size=16,
+                           jax_shapes=None, table_fill="zero", log=None):
     """Yield ``(jax_name, torch_tensor)`` ready for JaxAutoWeightsLoader.
 
     Args:
@@ -418,11 +437,15 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
         report: dict filled with ``filled``, ``missing``, ``unconsumed``,
             ``dropped``, ``dequantized`` for the load report artifact.
         bits/group_size: pinned GPTQ contract (INT4 / 128).
+        nvfp4_group_size: ModelOpt NVFP4 block size (16).
+        jax_shapes: optional {jax_name: shape} from the live model; used to
+            zero-fill the (host-side, phase 2) PLE table + validate fusions.
+        log: optional print-like sink.
 
     The generator buffers only incomplete linear groups (a few tensors) and
     per-layer expert accumulators; everything else streams through.
     """
-    from .quant import dequantize_gptq_torch
+    from .quant import dequantize_gptq_torch, dequantize_nvfp4_torch
 
     def _log(msg):
         if log is not None:
@@ -443,14 +466,26 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
     def _linear_piece(mapped_prefix, parts):
         """Assemble one linear's torch-layout (out, in) tensor from shards.
 
-        Returns (tensor, used_identity_g_idx). Plain .weight wins over GPTQ
-        shards when both exist (warns).
+        Returns (tensor, used_identity_g_idx) or (None, False) when
+        incomplete. Plain fp .weight wins over quantized shards when both
+        exist (warns). Handles GPTQ (qweight/qzeros/scales/[g_idx]) and
+        NVFP4 (uint8 weight + weight_scale + weight_scale_2).
         """
+        import torch
+
         if "weight" in parts and "qweight" in parts:
             _log(f"LOAD-WARN {mapped_prefix}: has both .weight and GPTQ "
                  f"shards; preferring .weight")
-        if "weight" in parts:
+        if "weight" in parts and parts["weight"].dtype != torch.uint8:
             return parts["weight"], False
+        if all(k in parts for k in ("weight", "weight_scale",
+                                    "weight_scale_2")) \
+                and parts["weight"].dtype == torch.uint8:
+            w = dequantize_nvfp4_torch(
+                parts["weight"], parts["weight_scale"],
+                parts["weight_scale_2"], group_size=nvfp4_group_size)
+            rep["dequantized"] += 1
+            return w.contiguous(), False
         need = ("qweight", "qzeros", "scales")
         if not all(k in parts for k in need):
             return None, False
@@ -497,6 +532,42 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
                     layer_base = base[: -len(shard) - 1]
                     return layer_base + "." + jax_suffix
         return None
+
+    def _validate_concat(target, merged):
+        """Shape-validate fused assemblies (fail loud with shapes)."""
+        import torch
+
+        rows, cols = (int(d) for d in merged.shape)
+        if target.endswith(".self_attn.qkv"):
+            n = int(arch.num_attention_heads)
+            d = int(arch.head_dim)
+            kv = int(arch.num_key_value_heads)
+            h = int(arch.hidden_size)
+            expect = 2 * n * d + 2 * kv * d
+            if rows != expect or cols != h:
+                raise ValueError(
+                    f"LOAD-FAIL {target}: fused qkv shape {(rows, cols)} != "
+                    f"expected {(expect, h)} (2*q+gate + 2*kv rows; q shard "
+                    f"must carry gate rows — see project())")
+            _log(f"LOAD-OK {target}: fused qkv rows={rows} (gate incl.)")
+        return merged
+
+    def _mixer_merged(target, down):
+        """Final-mixer merged down: ckpt ships down rows only (mix-only has
+        no injection path); zero-fill the HC inject rows (their only
+        consumer, combine(), is never called when use_combine=False)."""
+        import torch
+
+        hc = int(getattr(arch, "hc_count", 0) or 0)
+        lr = int(getattr(arch, "hc_lowrank", 0) or 0)
+        if down.shape[0] != lr:
+            raise ValueError(
+                f"LOAD-FAIL {target}: mixer down rows {down.shape[0]} != "
+                f"hc_lowrank {lr}")
+        _log(f"LOAD-OK {target}: mixer inject rows zero-filled "
+             f"(use_combine=False)")
+        return torch.cat(
+            [down, torch.zeros(hc, down.shape[1])], dim=0).contiguous()
 
     def _store_expert_piece(layer_base, expert_idx, proj, torch_w):
         """Accumulate one expert's torch-layout (out, in) linear.
@@ -565,14 +636,8 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
         yield; flushed False means incomplete (keep buffering).
         """
         out = []
-        if "weight" in parts and "qweight" in parts:
-            _log(f"LOAD-WARN {base}: has both .weight and GPTQ shards; "
-                 f"preferring .weight")
-        if "weight" in parts:
-            piece, used_identity = parts["weight"], False
-        elif all(k in parts for k in ("qweight", "qzeros", "scales")):
-            piece, used_identity = _linear_piece(base, parts)
-        else:
+        piece, used_identity = _linear_piece(base, parts)
+        if piece is None:
             return out, False  # incomplete: keep buffering
         exp = _is_expert_base(base)
         if exp is not None:
@@ -594,6 +659,7 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
             if _concat_ready(target, acc):
                 merged = _concat_shards(target, acc)
                 del concat_accum[target]
+                merged = _validate_concat(target, merged)
                 jax_name = _jax_name_for(target + ".weight", jax_set)
                 if jax_name is None:
                     raise ValueError(
@@ -630,8 +696,10 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
     import re as _re
 
     jax_set = set(jax_names)
+    jax_shapes = dict(jax_shapes or {})
     assumed_identity = set()
     concat_accum = {}
+    table_seen = []
     rep["warnings"] = []
     import torch as _torch
 
@@ -647,8 +715,26 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
         if mapped.endswith(".bias"):
             rep["dropped"][mapped] = rep["dropped"].get(mapped, 0) + 1
             continue
-        if is_gptq_aux(mapped):
+        if _is_table_tensor(mapped):
+            # 102 GB PLE table: never buffer values (host-side in phase 2).
+            # The JAX param is zero-filled at end of stream (neutral ablation;
+            # LOUD in warnings). Only shapes would matter; record kind counts.
+            table_seen.append(mapped.rpartition(".")[0])
+            rep["dropped"]["TABLE:" + mapped.rpartition(".")[2]] = \
+                rep["dropped"].get("TABLE:" + mapped.rpartition(".")[2], 0) + 1
+            continue
+        if _is_table_tensor(mapped):
+            # (duplicate guard: table pieces never reach other branches)
+            table_seen.append(mapped.rpartition(".")[0])
+            rep["dropped"]["TABLE:" + mapped.rpartition(".")[2]] = \
+                rep["dropped"].get("TABLE:" + mapped.rpartition(".")[2], 0) + 1
+            continue
+        if is_gptq_aux(mapped) or mapped.endswith(_NVFP4_KINDS):
             base, _, kind = mapped.rpartition(".")
+            if kind == "input_scale":
+                # NVFP4 W4A16 activation scale: unused (activations stay bf16).
+                rep["dropped"][mapped] = rep["dropped"].get(mapped, 0) + 1
+                continue
             if base in assumed_identity and kind == "g_idx":
                 if not _is_identity_g_idx(tensor, group_size):
                     raise ValueError(
@@ -698,11 +784,37 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
                 yield item
             if flushed:
                 continue
+        if "weight" not in parts and all(
+                k in parts for k in ("weight", "weight_scale",
+                                     "weight_scale_2")):
+            items, flushed = _complete_dense(base, parts)
+            for item in items:
+                yield item
+            if flushed:
+                continue
         rep["unconsumed"].append(
-            f"GROUP:{base}=" + ",".join(sorted(parts)))
+            f"GROUP:{base}=" + ",".join(
+                f"{k}{tuple(parts[k].shape)}" for k in sorted(parts)))
     for target in sorted(concat_accum):
+        acc = concat_accum[target]
+        if target.endswith("hyper_connection_mixer.down_block_inject") \
+                and len(acc) == 1:
+            # Mix-only final mixer: down rows shipped, inject rows absent.
+            down_base = sorted(acc)[0]
+            merged = _mixer_merged(target, acc[down_base])
+            del concat_accum[target]
+            jax_name = _jax_name_for(target + ".weight", jax_set)
+            if jax_name is None:
+                raise ValueError(
+                    f"LOAD-FAIL mixer target {target}.weight matches no "
+                    f"JAX param")
+            rep["assembled"] += 1
+            rep["warnings"].append(f"{target}: inject zero-filled")
+            yield _emit(jax_name, merged)
+            continue
         rep["unconsumed"].append(
-            f"CONCAT:{target}=" + ",".join(sorted(concat_accum[target])))
+            f"CONCAT:{target}=" + ",".join(
+                f"{b}{tuple(acc[b].shape)}" for b in sorted(acc)))
     for layer_base in sorted(experts):
         acc = experts[layer_base]
         have = {k: len(v) for k, v in acc.items()
@@ -716,7 +828,22 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
             yield _emit(jax_name, singles[ckpt_name])
             del singles[ckpt_name]
     for ckpt_name in sorted(singles):
-        rep["unconsumed"].append(ckpt_name)
+        t = singles[ckpt_name]
+        rep["unconsumed"].append(
+            f"{ckpt_name} {tuple(t.shape)} {str(t.dtype)}")
+    # PLE table: zero-filled neutral ablation (host-side lookup is phase 2).
+    if table_fill == "zero" and table_seen:
+        for jax_name in sorted(set(jax_names) - filled):
+            if jax_name.endswith(".ple.embedding.weight"):
+                shape = jax_shapes.get(jax_name)
+                if shape is None:
+                    raise ValueError(
+                        f"LOAD-FAIL {jax_name}: table zero-fill needs "
+                        f"jax_shapes (pass live-model shapes)")
+                _log(f"LOAD-WARN {jax_name}: zero-filled "
+                     f"{tuple(shape)} (table on host in phase 2)")
+                rep["warnings"].append(f"{jax_name}: zero-filled table")
+                yield _emit(jax_name, _torch.zeros(shape))
     rep["filled"] = sorted(filled)
     rep["missing"] = sorted(set(jax_names) - filled)
     if report is not None:

@@ -50,6 +50,14 @@ MODEL_TYPE = "qwen4_exp"
 _BUILT: tuple[Any, Any] | None = None
 
 
+def _strip_quantization_config(cfg_obj: Any) -> None:
+    """Best-effort post-init removal (from_dict strip is the real guard)."""
+    try:
+        del cfg_obj.__dict__["quantization_config"]
+    except (KeyError, AttributeError, TypeError):
+        pass
+
+
 def _build_config_classes() -> tuple[Any, Any]:
     """Create (Qwen4ExpTextConfig, Qwen4ExpConfig). Import-lazy on purpose:
     this package must stay importable without transformers (CPU unit tests,
@@ -81,21 +89,44 @@ def _build_config_classes() -> tuple[Any, Any]:
             # attribute must already exist (v46 died here).
             self.text_config = text_config
             super().__init__(**kwargs)
-            # GPTQ bypass (v48: "auto_gptq quantization is currently not
-            # supported in tpu"): vLLM instantiates its CUDA-only GPTQ path
-            # from EITHER --quantization gptq OR the checkpoint's
-            # quantization_config. We serve GPTQ weights via JAX-side CPU
-            # dequant at load (weight_loader), so both triggers are removed:
-            # serve_prod.py passes no --quantization flag, and the config
-            # entry is neutralized here (original stashed for reference).
-            for cfg_obj in (self, text_config):
-                qc = getattr(cfg_obj, "quantization_config", None)
-                if isinstance(cfg_obj, PretrainedConfig) and qc is not None:
+            # Belt-and-suspenders: from_dict (below) already strips
+            # quantization_config before construction; this covers direct
+            # construction paths.
+            _strip_quantization_config(self)
+            if isinstance(text_config, PretrainedConfig):
+                _strip_quantization_config(text_config)
+
+        @classmethod
+        def from_dict(cls, config_dict: Any, **kwargs: Any) -> Any:
+            """Strip quantization_config BEFORE construction (airtight).
+
+            vLLM resolves its (CUDA-only) quant path from the checkpoint's
+            quantization_config via override hooks (v48 GPTQ gate, v51
+            modelopt_fp4 JAX-universe gate). We serve quantized weights via
+            JAX-side load-time dequant, so the entry must never reach the
+            parsed config. Stripping here (rather than only post-init)
+            is immune to validated-setattr/delattr quirks: v51 died because
+            a stash setattr raised inside try/except, silently skipping the
+            delattr on transformers 5.12.
+            """
+            if isinstance(config_dict, dict):
+                config_dict = dict(config_dict)
+                qc = config_dict.pop("quantization_config", None)
+                text = config_dict.get("text_config")
+                if isinstance(text, dict):
+                    text = dict(text)
+                    text_qc = text.pop("quantization_config", None)
+                    config_dict["text_config"] = text
+                    qc = qc if qc is not None else text_qc
+                cfg = super().from_dict(config_dict, **kwargs)
+                if qc is not None:
                     try:
-                        cfg_obj.qwen4exp_quantization_config = qc
-                        delattr(cfg_obj, "quantization_config")
-                    except (AttributeError, TypeError):
+                        object.__setattr__(
+                            cfg, "qwen4exp_quantization_config", qc)
+                    except Exception:
                         pass
+                return cfg
+            return super().from_dict(config_dict, **kwargs)
 
         def get_text_config(self, *args: Any, **kwargs: Any) -> Any:
             # __dict__ lookup: recursion-proof against the custom

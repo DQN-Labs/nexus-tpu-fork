@@ -222,11 +222,62 @@ def dequantize_gptq_jax(qweight, qzeros, scales, g_idx, *, bits=4,
     return s[g] * (codes - zeros[g])
 
 
+# OCP E2M1 decode table (index = 4-bit code): exact for all 16 codes.
+_E2M1_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def dequantize_nvfp4_torch(weight_u8, weight_scale_fp8, global_scale,
+                           *, group_size=16):
+    """CPU dequant of one ModelOpt NVFP4 linear to float32 ``(out, in)``.
+
+    Layout (verified against vLLM 0.28 ``modelopt.py`` + tpu-inference's
+    ``u8_unpack_e2m1`` bitcast semantics, both low-nibble-first):
+    - ``weight`` uint8 ``(out, in//2)``: element ``2i`` = low nibble,
+      ``2i+1`` = high nibble, decoded via the E2M1 table.
+    - ``weight_scale`` fp8-e4m3 ``(out, in//16)``: one scale per 16-elem
+      input block; byte ``i`` uses block ``i // 8``.
+    - ``global_scale`` fp32 scalar (per-tensor ``weight_scale_2``).
+    No zero-points, no reordering. Raises ``ValueError`` with shapes on
+    any layout mismatch.
+    """
+    import torch
+
+    if weight_u8.ndim != 2 or weight_scale_fp8.ndim != 2:
+        raise ValueError(
+            f"NVFP4 weight {tuple(weight_u8.shape)} / scale "
+            f"{tuple(weight_scale_fp8.shape)} must both be 2D")
+    out, in_packed = (int(d) for d in weight_u8.shape)
+    in_features = in_packed * 2
+    if in_features % group_size:
+        raise ValueError(
+            f"in_features {in_features} not divisible by group_size "
+            f"{group_size}")
+    if tuple(weight_scale_fp8.shape) != (out, in_features // group_size):
+        raise ValueError(
+            f"weight_scale shape {tuple(weight_scale_fp8.shape)} != "
+            f"({out}, {in_features // group_size})")
+    g = global_scale.reshape(-1)
+    if int(g.numel()) != 1:
+        raise ValueError(
+            f"NVFP4 global scale must be scalar, got {tuple(global_scale.shape)}")
+    gs = float(g.reshape(()).to(torch.float32))
+    lut = torch.tensor(_E2M1_LUT, dtype=torch.float32)
+    w8 = weight_u8.to(torch.int64)
+    codes = torch.stack([(w8 & 0xF), ((w8 >> 4) & 0xF)], dim=-1)
+    vals = lut[codes.reshape(out, in_features)]
+    # byte i covers inputs (2i, 2i+1); both share byte-block i // 8.
+    blk = torch.arange(in_packed) // (group_size // 2)
+    sc = weight_scale_fp8.to(torch.float32)[:, blk].repeat_interleave(2, dim=1)
+    return sc * vals * gs
+
+
 __all__ = [
     "IGNORED_MISSING_SUFFIXES",
     "QUANT_SKIP_SUBSTR",
     "dequantize_gptq_jax",
     "dequantize_gptq_torch",
+    "dequantize_nvfp4_torch",
     "dequantize_q4_packed",
     "should_skip_quant",
 ]
