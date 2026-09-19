@@ -190,9 +190,42 @@ def dequantize_gptq_torch(qweight, qzeros, scales, g_idx, *, bits=4,
     return s[g] * (codes - zeros[g])
 
 
+def dequantize_gptq_jax(qweight, qzeros, scales, g_idx, *, bits=4,
+                        group_size=128):
+    """JAX twin of :func:`dequantize_gptq_torch` (identical integer math).
+
+    Used for dequant-in-forward under INT4 HBM residency: weights stay
+    packed int32 + bf16 scales on device and are expanded per matmul in
+    XLA (elementwise shifts/masks/gathers + bf16 dot), so v5e-8 HBM holds
+    the ~4-bit checkpoint instead of a full-precision copy. Returns
+    float32 ``(in, out)``; callers transpose/cast for their layout.
+    """
+    pack = 32 // bits
+    maxq = (1 << bits) - 1
+    qw = qweight.astype(jnp.int32)
+    in_packed, out = qw.shape
+    shifts = (jnp.arange(pack, dtype=jnp.int32) * bits).reshape(1, pack, 1)
+    codes = jnp.broadcast_to(qw[:, None, :], (in_packed, pack, out))
+    codes = ((codes >> shifts) & maxq).astype(jnp.float32)
+    codes = codes.reshape(in_packed * pack, out)
+    num_groups = scales.shape[0]
+    qz = qzeros.astype(jnp.int32)
+    zshifts = (jnp.arange(pack, dtype=jnp.int32) * bits).reshape(1, 1, pack)
+    zeros = jnp.broadcast_to(qz[:, :, None],
+                             (num_groups, qz.shape[1], pack))
+    zeros = ((zeros >> zshifts) & maxq).astype(jnp.float32)
+    zeros = zeros.reshape(num_groups, -1)[:, :out]
+    g = g_idx.reshape(-1).astype(jnp.int32)
+    in_features = int(g.shape[0])
+    codes = codes[:in_features]
+    s = scales.astype(jnp.float32)
+    return s[g] * (codes - zeros[g])
+
+
 __all__ = [
     "IGNORED_MISSING_SUFFIXES",
     "QUANT_SKIP_SUBSTR",
+    "dequantize_gptq_jax",
     "dequantize_gptq_torch",
     "dequantize_q4_packed",
     "should_skip_quant",

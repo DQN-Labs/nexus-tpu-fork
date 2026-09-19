@@ -655,6 +655,82 @@ def test_gptq_assembly_iterator():
 
 
 @requires_impl
+def test_gptq_jax_matches_torch_bit_exact():
+    """INT4-residency forward dequant must reproduce the CPU reference
+    exactly (same integer ops, elementwise float math)."""
+    torch = pytest.importorskip("torch")
+    import jax.numpy as jnp
+
+    from tpu_inference.models.jax.qwen4_exp import quant as quant_mod
+
+    torch.manual_seed(7)
+    O, I, gs, G, pack = 48, 64, 16, 4, 8
+    codes = torch.randint(0, 16, (O, I), dtype=torch.int32)
+    zeros = torch.randint(0, 16, (G, O), dtype=torch.int32)
+    scales = (torch.rand(G, O) * 0.5 + 0.1).to(torch.bfloat16)
+    g_idx = torch.arange(I) // gs
+    qw = torch.zeros(I // pack, O, dtype=torch.int32)
+    for k in range(pack):
+        qw = qw + codes[:, k::pack].T * (1 << (4 * k))
+    qz = torch.zeros(G, O // pack, dtype=torch.int32)
+    for k in range(pack):
+        qz = qz + zeros[:, k::pack] * (1 << (4 * k))
+    ref = quant_mod.dequantize_gptq_torch(
+        qw, qz, scales, g_idx.to(torch.int32), bits=4, group_size=gs)
+    got = quant_mod.dequantize_gptq_jax(
+        jnp.asarray(qw.numpy()), jnp.asarray(qz.numpy()),
+        jnp.asarray(scales.float().numpy()), jnp.asarray(g_idx.numpy()),
+        bits=4, group_size=gs)
+    np.testing.assert_array_equal(np.asarray(got), ref.numpy())
+
+
+@requires_impl
+def test_qlinear_forward_matches_dequant_reference():
+    """Qwen4ExpQLinear forward == matmul with the CPU-dequantized weight."""
+    torch = pytest.importorskip("torch")
+    import jax.numpy as jnp
+    import numpy as np
+    from flax import nnx
+
+    from tpu_inference.models.jax.qwen4_exp import quant as quant_mod
+    from tpu_inference.models.jax.qwen4_exp.qlinear import Qwen4ExpQLinear
+
+    torch.manual_seed(3)
+    O, I, gs, G = 32, 64, 16, 4
+    Wtrue = torch.randn(O, I)
+    scales = torch.empty(G, O)
+    zeros = torch.empty(G, O, dtype=torch.int32)
+    g_idx = torch.arange(I) // gs
+    for gg in range(G):
+        blk = Wtrue[:, gg * gs:(gg + 1) * gs]
+        mn, mx = blk.min(dim=1).values, blk.max(dim=1).values
+        s = ((mx - mn) / 15).clamp_min(1e-6)
+        scales[gg] = s
+        zeros[gg] = torch.round(-mn / s).clamp(0, 15).to(torch.int32)
+    codes = torch.clamp(
+        torch.round(Wtrue / scales[g_idx].T + zeros[g_idx].float().T),
+        0, 15).to(torch.int32)
+    qw = torch.zeros(I // 8, O, dtype=torch.int32)
+    for k in range(8):
+        qw = qw + codes[:, k::8].T * (1 << (4 * k))
+    qz = torch.zeros(G, O // 8, dtype=torch.int32)
+    for k in range(8):
+        qz = qz + zeros[:, k::8] * (1 << (4 * k))
+    mod = Qwen4ExpQLinear(I, O, bits=4, group_size=gs,
+                          dtype=jnp.float32, rngs=nnx.Rngs(0))
+    mod.qweight.value = jnp.asarray(qw.numpy())
+    mod.qzeros.value = jnp.asarray(qz.numpy())
+    mod.scales.value = jnp.asarray(scales.to(torch.bfloat16).float().numpy())
+    mod.g_idx.value = jnp.asarray(g_idx.numpy())
+    x = jnp.asarray(torch.randn(5, I).numpy())
+    ref = quant_mod.dequantize_gptq_torch(
+        qw, qz, scales.to(torch.bfloat16), g_idx.to(torch.int32),
+        bits=4, group_size=gs).numpy().T
+    np.testing.assert_allclose(
+        np.asarray(mod(x)), np.asarray(x) @ ref.T, rtol=1e-4, atol=1e-3)
+
+
+@requires_impl
 def test_hf_config_neutralizes_gptq(tmp_path):
     """vLLM must not see quantization_config (its CUDA-only GPTQ gate
     rejects TPU); the original is stashed, everything else preserved."""
