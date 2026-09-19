@@ -74,5 +74,34 @@ else:
           f"ignored={len(ignored)} unknown={len(unknown)}")
     print("status:", rep["status"])
 
+    # Structural histogram: per-submodule tensor inventory (names only) so
+    # the JAX loader's rename/assembly table can be audited without moving
+    # 187 GB. Key: "<layer-scope> | <submodule> | <kind>" where kind is the
+    # last component (weight/qweight/...). Layer indices collapsed to #.
+    import re as _re
+    hist = {}
+    for n in names:
+        parts = n.split(".")
+        scope = "top"
+        for i, p in enumerate(parts):
+            if p == "layers" and i + 1 < len(parts):
+                scope = "layers.#"
+                rest = parts[i + 2:]
+                break
+        else:
+            rest = parts[2:] if parts[:1] == ["model"] else parts
+            if parts[:2] == ["model", "mtp"] or parts[:1] == ["mtp"]:
+                scope = "mtp"
+        kind = rest[-1] if rest else "?"
+        mod = ".".join(rest[:-1]) if len(rest) > 1 else "(root)"
+        mod = _re.sub(r"\.\d+\.", ".#.", "." + mod + ".").strip(".")
+        key = f"{scope} | {mod} | {kind}"
+        hist[key] = hist.get(key, 0) + 1
+    rep["histogram"] = dict(sorted(hist.items()))
+    print(f"histogram groups: {len(hist)}")
+    # quantization_config echo (what the loader bypass neutralizes).
+    rep["quantization_config"] = cfg.get("quantization_config",
+                                         text.get("quantization_config", None))
+
 Path("/kaggle/working/inspect_results.json").write_text(json.dumps(rep, indent=1))
 print("INSPECTION COMPLETE")

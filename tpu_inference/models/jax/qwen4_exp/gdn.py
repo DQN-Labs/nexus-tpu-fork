@@ -47,6 +47,8 @@ except ImportError:  # pragma: no cover
     class JaxModule(nnx.Module):  # type: ignore[no-redef]
         pass
 
+from ._jax_compat import JaxEinsum
+
 _init = nnx.initializers.uniform()
 
 
@@ -98,19 +100,21 @@ class Qwen4ExpGDN(JaxModule):
         qkv_dim = (
             2 * num_k_heads * k_head_dim + 2 * num_v_heads * v_head_dim
         )
-        self.in_proj_qkvz = nnx.Einsum(
+        self.in_proj_qkvz = JaxEinsum(
             "TD,DK->TK",
             (hidden_size, qkv_dim),
             param_dtype=jnp.float32,
             kernel_init=nnx.with_partitioning(_init, (None, "model")),
             rngs=rngs,
+            prefix=prefix + ".in_proj_qkvz",
         )
-        self.in_proj_ba = nnx.Einsum(
+        self.in_proj_ba = JaxEinsum(
             "TD,DK->TK",
             (hidden_size, 2 * num_v_heads),
             param_dtype=jnp.float32,
             kernel_init=nnx.with_partitioning(_init, (None, "model")),
             rngs=rngs,
+            prefix=prefix + ".in_proj_ba",
         )
         self.conv_weight = nnx.Param(
             jnp.zeros((2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim,
@@ -121,12 +125,13 @@ class Qwen4ExpGDN(JaxModule):
         self.norm_w = nnx.Param(
             jnp.zeros((num_v_heads * v_head_dim,), dtype=jnp.float32)
         )
-        self.out_proj = nnx.Einsum(
+        self.out_proj = JaxEinsum(
             "TD,DK->TK",
             (num_v_heads * v_head_dim, hidden_size),
             param_dtype=jnp.float32,
             kernel_init=nnx.with_partitioning(_init, ("model", None)),
             rngs=rngs,
+            prefix=prefix + ".out_proj",
         )
 
     def split_qkvz(
@@ -203,12 +208,12 @@ class Qwen4ExpGDN(JaxModule):
         mixed = jnp.einsum(
             "TD,DK->TK",
             x.astype(jnp.float32),
-            self.in_proj_qkvz.kernel.value.astype(jnp.float32),
+            self.in_proj_qkvz.weight.value.astype(jnp.float32),
         ).astype(x.dtype)
         ba = jnp.einsum(
             "TD,DK->TK",
             x.astype(jnp.float32),
-            self.in_proj_ba.kernel.value.astype(jnp.float32),
+            self.in_proj_ba.weight.value.astype(jnp.float32),
         ).astype(x.dtype)
         q, k, v, z = self.split_qkvz(mixed)
         b, a = ba[..., : self.num_v_heads], ba[..., self.num_v_heads :]
@@ -257,7 +262,7 @@ class Qwen4ExpGDN(JaxModule):
                 return jnp.einsum(
                     "TD,DK->TK",
                     out.astype(jnp.float32),
-                    self.out_proj.kernel.value.astype(jnp.float32),
+                    self.out_proj.weight.value.astype(jnp.float32),
                 ).astype(x.dtype)
             except (ImportError, AttributeError):
                 pass
@@ -270,7 +275,7 @@ class Qwen4ExpGDN(JaxModule):
         return jnp.einsum(
             "TD,DK->TK",
             out.astype(jnp.float32),
-            self.out_proj.kernel.value.astype(jnp.float32),
+            self.out_proj.weight.value.astype(jnp.float32),
         ).astype(x.dtype)
 
 

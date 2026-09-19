@@ -127,7 +127,9 @@ def test_config_defaults_and_validation():
 @requires_impl
 def test_weight_name_mapping():
     m = wl_mod.map_checkpoint_name("model.language_model.layers.3.self_attn.qkv_proj.weight")
-    assert m == "model.layers.3.self_attn.qkv_proj.weight"
+    assert m == "model.layers.3.self_attn.qkv.weight"
+    m = wl_mod.map_checkpoint_name("model.language_model.layers.3.ple.ple_embedding.weight")
+    assert m == "model.layers.3.ple.embedding.weight"
     assert wl_mod.stacked_target("model.layers.0.ple.key_proj.weight")[1] == 0
     assert wl_mod.stacked_target("model.layers.0.ple.value_proj.weight")[1] == 1
     remapped = wl_mod.remap_qsa_scale_name(
@@ -291,8 +293,8 @@ def test_hc_combine_matches_reference(mesh):
     assert inj is not None and inj.shape == (4, hc)
     xn = hc_mod.grouped_gemma_rmsnorm(
         x, mod.hc_norm.weight.value, 1e-6, hc).astype(jnp.float32)
-    down = mod.down_block_inject.kernel.value.astype(jnp.float32)
-    up = mod.up.kernel.value.astype(jnp.float32)
+    down = mod.down_block_inject.weight.value.astype(jnp.float32)
+    up = mod.up.weight.value.astype(jnp.float32)
     lora = jax.nn.silu(xn @ down[:, :4] / float(hc))
     gate = (lora @ up).reshape(4, hc, h)
     ref_in = jnp.mean(
@@ -448,7 +450,7 @@ def test_dense_qkv_gate_interleave(mesh):
     out_dim = 2 * nh * hd + 2 * kvh * hd
     # JAX kernel col r == torch row r: fill col r with constant r so the
     # fused activation at x=ones is hdim*r (direction preserved by RMSNorm).
-    attn.qkv_proj.kernel.value = jnp.tile(
+    attn.qkv.weight.value = jnp.tile(
         jnp.arange(out_dim, dtype=jnp.float32)[None, :], (hdim, 1))
     x = jnp.ones((1, hdim), dtype=jnp.float32)
     q, k, v, gate = attn.project(x)
@@ -505,6 +507,178 @@ def test_hf_config_autoconfig_parses_qwen4_exp(tmp_path):
     assert cfg.text_config.hidden_size == 2560
     assert cfg.text_config.hc_count == 4  # extras preserved
     assert cfg.text_config.indexer_n_heads == 8
+
+
+@requires_impl
+def test_loader_heuristic_audit():
+    """JaxAutoWeightsLoader assigns reshape/permute heuristics by NAME
+    substring (tpu-inference 0.28 weight_utils). A JAX name accidentally
+    containing k/v/q_proj.weight would route a 2D param into the 3D branch
+    and crash loader construction (v48 root cause). This pins the safe set:
+    only o_proj hits a 3D branch (3D by construction), embed/lm_head hit
+    their intended branches, everything else takes the default transpose.
+    """
+    from tpu_inference.models.jax.qwen4_exp import config as cfg_mod
+    from tpu_inference.models.jax.qwen4_exp import weight_loader as wl_mod
+
+    arch = cfg_mod.arch_from_hf_config({
+        "hidden_size": 64, "num_hidden_layers": 4, "num_attention_heads": 4,
+        "num_key_value_heads": 2, "head_dim": 16, "intermediate_size": 128,
+        "vocab_size": 256, "layer_types": ["full_attention",
+                                           "linear_attention"] * 2,
+        "ple_layer_ids": [2], "hc_count": 2, "num_experts": 4,
+        "num_experts_per_tok": 2, "moe_intermediate_size": 16,
+        "shared_expert_intermediate_size": 16,
+        "indexer_n_heads": 2, "indexer_kv_heads": 1, "indexer_head_dim": 8,
+        "indexer_budget": 512, "indexer_compress_ratio": 1,
+    })
+    names = wl_mod.expected_jax_names(arch)
+    assert len(names) > 80
+    o_proj = [n for n in names if "o_proj.weight" in n]
+    assert o_proj and all(".self_attn.o_proj.weight" in n for n in o_proj)
+    for n in names:
+        assert "k_proj.weight" not in n, n
+        assert "v_proj.weight" not in n, n
+        assert "q_proj.weight" not in n, n
+        assert "q_proj.bias" not in n and "k_proj.bias" not in n \
+            and "v_proj.bias" not in n, n
+        if "lm_head" in n:
+            assert n.endswith("lm_head.weight"), n
+        if "embed_tokens.weight" in n:
+            assert n.endswith("model.embed_tokens.weight"), n
+    # fused/renamed linears keep loader-safe names
+    assert any(n.endswith(".self_attn.qkv.weight") for n in names)
+    assert any(n.endswith(".ple.kv.weight") for n in names)
+    assert any(n.endswith(".indexer.index_qk.weight") for n in names)
+    assert any(n.endswith(".mlp.exp_gate_up") for n in names)
+
+
+@requires_impl
+def test_gptq_assembly_iterator():
+    """Synthetic GPTQModel-v2 checkpoint -> JAX-named tensors.
+
+    Covers: plain passthrough + renames, GPTQ dequant (reconstruction
+    bound), expert stack/fuse, concat order, norm rename, gate_up split,
+    and empty missing/unconsumed reports.
+    """
+    torch = pytest.importorskip("torch")
+    from tpu_inference.models.jax.qwen4_exp import weight_loader as wl_mod
+
+    torch.manual_seed(0)
+    from types import SimpleNamespace
+    arch = SimpleNamespace(num_experts=2, hidden_size=32,
+                           moe_intermediate_size=16)
+
+    def gptq_group(prefix, O, I, gs=8):
+        G = I // gs
+        Wtrue = torch.randn(O, I) * 2
+        scales = torch.empty(G, O)
+        zeros = torch.empty(G, O, dtype=torch.int32)
+        g_idx = torch.arange(I) // gs
+        for gg in range(G):
+            blk = Wtrue[:, gg * gs:(gg + 1) * gs]
+            mn, mx = blk.min(dim=1).values, blk.max(dim=1).values
+            s = ((mx - mn) / 15).clamp_min(1e-6)
+            z = torch.round(-mn / s).clamp(0, 15).to(torch.int32)
+            scales[gg] = s
+            zeros[gg] = z
+        codes = torch.clamp(
+            torch.round(Wtrue / scales[g_idx].T + zeros[g_idx].float().T),
+            0, 15).to(torch.int32)
+        qw = torch.zeros(I // 8, O, dtype=torch.int32)
+        for k in range(8):
+            qw = qw + codes[:, k::8].T * (1 << (4 * k))
+        qz = torch.zeros(G, O // 8, dtype=torch.int32)
+        for k in range(8):
+            qz = qz + zeros[:, k::8] * (1 << (4 * k))
+        return {prefix + ".qweight": qw, prefix + ".qzeros": qz,
+                prefix + ".scales": scales.to(torch.bfloat16),
+                prefix + ".g_idx": g_idx.to(torch.int32)}, Wtrue
+
+    stream = [(("model.language_model.layers.0.self_attn.qkv_proj.weight"),
+               torch.randn(40, 32))]
+    _g, Wt = gptq_group("model.layers.0.self_attn.o_proj", 32, 40, gs=8)
+    stream += list(_g.items())
+    exp_true = {}
+    for e in range(2):
+        for p, (O, I) in (("gate_proj", (16, 32)), ("up_proj", (16, 32)),
+                           ("down_proj", (32, 16))):
+            gg, Wt2 = gptq_group(
+                f"model.layers.0.mlp.experts.{e}.{p}", O, I, gs=8)
+            stream += list(gg.items())
+            exp_true[(e, p)] = Wt2
+    d_extra = {
+        "model.layers.0.ple.key_proj.weight": torch.randn(20, 64),
+        "model.layers.0.ple.value_proj.weight": torch.randn(12, 64),
+        "model.layers.0.self_attn.q_norm.weight": torch.randn(8),
+        "model.layers.0.mlp.shared_expert.gate_up_proj.weight":
+            torch.randn(32, 32),
+    }
+    stream += list(d_extra.items())
+    jax_names = [
+        "model.layers.0.self_attn.qkv.weight",
+        "model.layers.0.mlp.exp_gate_up",
+        "model.layers.0.mlp.exp_down",
+        "model.layers.0.ple.kv.weight",
+        "model.layers.0.self_attn.q_norm_w",
+        "model.layers.0.mlp.shared_expert.gate_proj.weight",
+        "model.layers.0.mlp.shared_expert.up_proj.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+    ]
+    rep = {}
+    out = dict(wl_mod.iter_jax_named_weights(
+        iter(stream), arch, jax_names, report=rep, group_size=8))
+    assert rep["missing"] == []
+    assert rep["unconsumed"] == []
+    assert rep["dequantized"] == 7 and rep["assembled"] == 2
+    assert torch.equal(out["model.layers.0.self_attn.qkv.weight"], stream[0][1])
+    assert (out["model.layers.0.self_attn.o_proj.weight"] - Wt).abs().max() < 0.5
+    gu = out["model.layers.0.mlp.exp_gate_up"]
+    assert gu.shape == (32, 2, 32)
+    assert torch.allclose(gu[:, 0, :16], exp_true[(0, "gate_proj")].T, atol=0.6)
+    assert torch.allclose(gu[:, 0, 16:], exp_true[(0, "up_proj")].T, atol=0.6)
+    assert torch.allclose(gu[:, 1, :16], exp_true[(1, "gate_proj")].T, atol=0.6)
+    assert torch.allclose(gu[:, 1, 16:], exp_true[(1, "up_proj")].T, atol=0.6)
+    dn = out["model.layers.0.mlp.exp_down"]
+    assert dn.shape == (2, 16, 32)
+    assert torch.allclose(dn[0], exp_true[(0, "down_proj")].T, atol=0.6)
+    assert torch.allclose(dn[1], exp_true[(1, "down_proj")].T, atol=0.6)
+    kv = out["model.layers.0.ple.kv.weight"]
+    assert kv.shape == (32, 64)
+    assert torch.equal(kv[:20], d_extra["model.layers.0.ple.key_proj.weight"])
+    assert torch.equal(kv[20:], d_extra["model.layers.0.ple.value_proj.weight"])
+    assert torch.equal(out["model.layers.0.self_attn.q_norm_w"],
+                       d_extra["model.layers.0.self_attn.q_norm.weight"])
+    assert torch.equal(
+        out["model.layers.0.mlp.shared_expert.gate_proj.weight"],
+        d_extra["model.layers.0.mlp.shared_expert.gate_up_proj.weight"][:16])
+
+
+@requires_impl
+def test_hf_config_neutralizes_gptq(tmp_path):
+    """vLLM must not see quantization_config (its CUDA-only GPTQ gate
+    rejects TPU); the original is stashed, everything else preserved."""
+    import json
+
+    transformers = pytest.importorskip("transformers")
+    from tpu_inference.models.jax.qwen4_exp import hf_config as hf_mod
+
+    hf_mod.install_hf_config()
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "qwen4_exp",
+        "architectures": ["Qwen4ExpForCausalLM"],
+        "hidden_size": 2560, "num_hidden_layers": 48,
+        "quantization_config": {"quant_method": "gptq", "bits": 4,
+                                "group_size": 128, "desc_act": False,
+                                "sym": False},
+        "text_config": {"model_type": "qwen4_exp", "hidden_size": 2560,
+                        "num_hidden_layers": 48},
+    }))
+    cfg = transformers.AutoConfig.from_pretrained(str(tmp_path))
+    assert not hasattr(cfg, "quantization_config")
+    assert cfg.qwen4exp_quantization_config["quant_method"] == "gptq"
+    assert cfg.text_config.hidden_size == 2560
+    assert not hasattr(cfg.text_config, "quantization_config")
 
 
 @pytest.mark.skipif(os.environ.get("QWEN4EXP_E2E") != "1",

@@ -50,6 +50,8 @@ except ImportError:  # pragma: no cover
     class JaxModule(nnx.Module):  # type: ignore[no-redef]
         pass
 
+from ._jax_compat import JaxEinsum
+
 _init = nnx.initializers.uniform()
 
 
@@ -129,19 +131,27 @@ class Qwen4ExpDenseAttention(JaxModule):
         self.prefix = prefix
         rngs = rngs or nnx.Rngs(0)
         q_out = num_heads * head_dim * (2 if attn_output_gate else 1)
-        self.qkv_proj = nnx.Einsum(
+        # NOTE: attribute is ``qkv`` (not ``qkv_proj``): the loader assigns
+        # 2D reshape/permute heuristics by name substring, and "qkv_proj"
+        # contains "v_proj" which would route it into the 3D k/v path and
+        # crash construction. JAX name: ``...self_attn.qkv.weight``.
+        self.qkv = JaxEinsum(
             "TD,DK->TK",
             (hidden_size, q_out + 2 * num_kv_heads * head_dim),
             param_dtype=jnp.float32,
             kernel_init=nnx.with_partitioning(_init, (None, "model")),
             rngs=rngs,
+            prefix=prefix + ".qkv",
         )
-        self.o_proj = nnx.Einsum(
-            "TD,DK->TK",
-            (num_heads * head_dim, hidden_size),
+        # In-tree 3D layout (N, D, H) with "TNH,NHD->TD", matching qwen3.py:
+        # the loader's o_proj heuristic is built for exactly this shape.
+        self.o_proj = JaxEinsum(
+            "TNH,NHD->TD",
+            (num_heads, head_dim, hidden_size),
             param_dtype=jnp.float32,
-            kernel_init=nnx.with_partitioning(_init, ("model", None)),
+            kernel_init=nnx.with_partitioning(_init, ("model", None, None)),
             rngs=rngs,
+            prefix=prefix + ".o_proj",
         )
         self.q_norm_w = nnx.Param(jnp.zeros((head_dim,), dtype=jnp.float32))
         self.k_norm_w = nnx.Param(jnp.zeros((head_dim,), dtype=jnp.float32))
@@ -152,7 +162,7 @@ class Qwen4ExpDenseAttention(JaxModule):
         fused = jnp.einsum(
             "TD,DK->TK",
             x.astype(jnp.float32),
-            self.qkv_proj.kernel.value.astype(jnp.float32),
+            self.qkv.weight.value.astype(jnp.float32),
         )
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
@@ -227,8 +237,7 @@ class Qwen4ExpDenseAttention(JaxModule):
         o = jnp.einsum("NTS,SNH->TNH", probs, v)
         if gate is not None:
             o = o * jax.nn.sigmoid(gate.astype(jnp.float32)).astype(o.dtype)
-        w_o = self.o_proj.kernel.value.astype(jnp.float32).reshape(
-            self.num_heads, self.head_dim, self.hidden_size)
+        w_o = self.o_proj.weight.value.astype(jnp.float32)
         out = jnp.einsum("TNH,NHD->TD", o.astype(jnp.float32), w_o).astype(x.dtype)
         return kv_cache, out
 

@@ -272,6 +272,77 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
         assert isinstance(self.model.embed_tokens, JaxEmbed)
         return self.model.embed_tokens.decode(hidden_states)
 
+    def load_weights(self, weights) -> set:
+        """GPTQ-aware loading.
+
+        vLLM's CUDA-only auto_gptq path is bypassed (see weight_loader):
+        this wraps the raw checkpoint stream with CPU dequant + fused-param
+        assembly into JAX-named tensors, then delegates assignment to the
+        standard JAX auto-loader. Raises loudly on any unfilled JAX param.
+        """
+        from .weight_loader import iter_jax_named_weights
+        from tpu_inference.models.jax.utils.weight_utils import (
+            JaxAutoWeightsLoader,
+        )
+
+        arch = self.model.arch
+        jax_names = [n for n, _ in self.named_parameters()]
+        report: dict = {}
+        gen = iter_jax_named_weights(
+            iter(weights), arch, jax_names, report=report,
+            log=lambda m: print(m, flush=True))
+        vcfg = getattr(self, "vllm_config", None)
+        loader = JaxAutoWeightsLoader(
+            self,
+            pytorch_pooler=getattr(vcfg, "pytorch_pooler", None),
+            skip_prefixes=(["lm_head"]
+                           if not hasattr(self, "lm_head") else None),
+        )
+        loaded = loader.load_weights(gen)
+        filled = set(report.get("filled", []))
+        missing = report.get("missing", [])
+        unconsumed = report.get("unconsumed", [])
+        summary = {
+            "jax_params": len(jax_names),
+            "filled": len(filled),
+            "autoloader_loaded": sorted(loaded),
+            "missing": missing,
+            "missing_count": len(missing),
+            "unconsumed_count": len(unconsumed),
+            "unconsumed_sample": unconsumed[:40],
+            "dropped_kinds": len(report.get("dropped", {})),
+            "dequantized": report.get("dequantized", 0),
+            "assembled": report.get("assembled", 0),
+            "warnings": report.get("warnings", []),
+        }
+        print(f"LOAD-REPORT filled={len(filled)}/{len(jax_names)} "
+              f"dequant={summary['dequantized']} assembled={summary['assembled']} "
+              f"missing={len(missing)} unconsumed={len(unconsumed)}",
+              flush=True)
+        for m in missing[:20]:
+            print(f"LOAD-MISSING {m}", flush=True)
+        for u in unconsumed[:20]:
+            print(f"LOAD-UNCONSUMED {u}", flush=True)
+        try:
+            from pathlib import Path as _P
+
+            for cand in ("/kaggle/working/load_report.json",
+                         "/tmp/qwen4exp_load_report.json"):
+                try:
+                    _P(cand).write_text(__import__("json").dumps(
+                        summary, indent=1)[:200000])
+                    print(f"LOAD-REPORT wrote {cand}", flush=True)
+                    break
+                except OSError:
+                    continue
+        except Exception as e:  # noqa: BLE001 - report must not break load
+            print(f"LOAD-REPORT write skipped: {e}", flush=True)
+        if missing:
+            raise RuntimeError(
+                f"LOAD-FAIL {len(missing)} JAX params unfilled "
+                f"(first 20: {missing[:20]})")
+        return loaded
+
 
 class Qwen4ExpMTP(JaxModule):
     """Speculative draft model (arch ``Qwen4ExpMTP``).

@@ -3,7 +3,13 @@ from pathlib import Path
 
 # Pinned quant contract for the production export: GPTQ INT4, group_size
 # 128, asymmetric (zeros kept), DescAct=False.
-QUANT = "gptq"
+# NOTE (v48): do NOT pass --quantization gptq. vLLM's GPTQ path is CUDA-only
+# and its ModelConfig gate rejects GPTQ on TPU outright ("auto_gptq
+# quantization is currently not supported in tpu"). The fork serves GPTQ
+# weights via JAX-side CPU dequant at load (weight_loader dequantizes
+# qweight/qzeros/scales into float params); the checkpoint's
+# quantization_config is neutralized in hf_config.py so vLLM never builds
+# its GPTQ config from either trigger.
 MAX_MODEL_LEN = 32768
 MAX_NUM_SEQS = 16
 
@@ -18,7 +24,7 @@ else:
     log = open("/kaggle/working/vllm_server.log", "w")
     env = dict(os.environ, TPU_BACKEND_TYPE="jax")
     cmd = [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve",
-           model_path, "--quantization", QUANT,
+           model_path,
            "--tensor-parallel-size", "8", "--max-model-len", str(MAX_MODEL_LEN),
            "--max-num-seqs", str(MAX_NUM_SEQS), "--port", "8000"]
     print(" ".join(cmd), flush=True)
@@ -50,7 +56,7 @@ else:
         tail = [f"<log unreadable: {e}>"]
         print(tail[0])
     Path("/kaggle/working/server_info.json").write_text(json.dumps(
-        {"startup_s": startup_s, "path": model_path, "quant": QUANT,
+        {"startup_s": startup_s, "path": model_path, "quant": "gptq-jax-dequant",
          "max_model_len": MAX_MODEL_LEN, "healthy": healthy,
          "returncode": proc.poll(), "server_log_tail": tail[-60:]}))
     assert healthy, "FAIL: server did not become healthy (see tail above)"

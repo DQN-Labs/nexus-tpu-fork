@@ -44,6 +44,8 @@ except ImportError:  # pragma: no cover
     class JaxModule(nnx.Module):  # type: ignore[no-redef]
         pass
 
+from ._jax_compat import JaxEinsum
+
 _init = nnx.initializers.uniform()
 
 
@@ -66,26 +68,29 @@ class Qwen4ExpMLP(JaxModule):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         rngs = rngs or nnx.Rngs(0)
-        self.gate_proj = nnx.Einsum(
+        self.gate_proj = JaxEinsum(
             "TD,DK->TK", (hidden_size, intermediate_size),
             param_dtype=jnp.float32,
-            kernel_init=nnx.with_partitioning(_init, (None, "model")), rngs=rngs)
-        self.up_proj = nnx.Einsum(
+            kernel_init=nnx.with_partitioning(_init, (None, "model")), rngs=rngs,
+            prefix=prefix + ".gate_proj")
+        self.up_proj = JaxEinsum(
             "TD,DK->TK", (hidden_size, intermediate_size),
             param_dtype=jnp.float32,
-            kernel_init=nnx.with_partitioning(_init, (None, "model")), rngs=rngs)
-        self.down_proj = nnx.Einsum(
+            kernel_init=nnx.with_partitioning(_init, (None, "model")), rngs=rngs,
+            prefix=prefix + ".up_proj")
+        self.down_proj = JaxEinsum(
             "TD,DK->TK", (intermediate_size, hidden_size),
             param_dtype=jnp.float32,
-            kernel_init=nnx.with_partitioning(_init, ("model", None)), rngs=rngs)
+            kernel_init=nnx.with_partitioning(_init, ("model", None)), rngs=rngs,
+            prefix=prefix + ".down_proj")
 
     def __call__(self, x: jax.Array) -> jax.Array:
         xf = x.astype(jnp.float32)
-        g = jnp.einsum("TD,DK->TK", xf, self.gate_proj.kernel.value.astype(jnp.float32))
-        u = jnp.einsum("TD,DK->TK", xf, self.up_proj.kernel.value.astype(jnp.float32))
+        g = jnp.einsum("TD,DK->TK", xf, self.gate_proj.weight.value.astype(jnp.float32))
+        u = jnp.einsum("TD,DK->TK", xf, self.up_proj.weight.value.astype(jnp.float32))
         h = silu(g) * u
         return jnp.einsum(
-            "TK,KD->TD", h, self.down_proj.kernel.value.astype(jnp.float32)
+            "TK,KD->TD", h, self.down_proj.weight.value.astype(jnp.float32)
         ).astype(x.dtype)
 
 
@@ -120,10 +125,11 @@ class Qwen4ExpMoE(JaxModule):
         self.norm_topk_prob = norm_topk_prob
         self.prefix = prefix
         rngs = rngs or nnx.Rngs(0)
-        self.gate = nnx.Einsum(
+        self.gate = JaxEinsum(
             "TD,DK->TK", (hidden_size, num_experts),
             param_dtype=jnp.float32,
-            kernel_init=nnx.with_partitioning(_init, (None, "model")), rngs=rngs)
+            kernel_init=nnx.with_partitioning(_init, (None, "model")), rngs=rngs,
+            prefix=prefix + ".gate")
         # Fused gate_up: [E, 2*I, H] stored as [2*I, E*H]-ish einsum kernel
         # [H, E, 2I] for XLA-friendly gather.
         self.exp_gate_up = nnx.Param(
@@ -142,7 +148,7 @@ class Qwen4ExpMoE(JaxModule):
     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
         logits = jnp.einsum(
             "TD,DK->TK", x.astype(jnp.float32),
-            self.gate.kernel.value.astype(jnp.float32))
+            self.gate.weight.value.astype(jnp.float32))
         weights, idx = jax.lax.top_k(logits, self.topk)
         if self.norm_topk_prob:
             weights = weights / jnp.sum(weights, axis=-1, keepdims=True)

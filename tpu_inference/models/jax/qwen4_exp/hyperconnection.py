@@ -47,13 +47,12 @@ from jax.sharding import Mesh
 
 try:
     from tpu_inference.layers.jax import JaxModule
-    from tpu_inference.layers.jax.linear import JaxEinsum
 except ImportError:  # pragma: no cover - allows CPU-only unit tests
 
     class JaxModule(nnx.Module):  # type: ignore[no-redef]
         pass
 
-    JaxEinsum = None  # type: ignore[assignment]
+from ._jax_compat import JaxEinsum
 
 _init = nnx.initializers.uniform()
 
@@ -145,23 +144,24 @@ class GatedResidual(JaxModule):
             hidden_size, hc_count, eps, dtype, rngs, prefix + ".hc_norm"
         )
         # Merged down projection: [HC*H] -> [lowrank + HC].
-        self.down_block_inject = nnx.Einsum(
+        # JaxEinsum (not raw nnx.Einsum): the ``.weight`` alias is what the
+        # loader matches on (raw Einsum kernels are invisible to it).
+        self.down_block_inject = JaxEinsum(
             "TD,DK->TK",
             (wide, hc_lowrank + hc_count),
             param_dtype=jnp.float32,
             kernel_init=nnx.with_partitioning(_init, (None, "model")),
             rngs=rngs,
+            prefix=prefix + ".down_block_inject",
         )
-        # Alias so generic weight loaders matching on "weight" work.
-        self.down_block_inject_weight = self.down_block_inject.kernel
-        self.up = nnx.Einsum(
+        self.up = JaxEinsum(
             "TD,DK->TK",
             (hc_lowrank, wide),
             param_dtype=jnp.float32,
             kernel_init=nnx.with_partitioning(_init, ("model", None)),
             rngs=rngs,
+            prefix=prefix + ".up",
         )
-        self.up_weight = self.up.kernel
 
     # -- core ops -----------------------------------------------------
     def mix(
@@ -174,7 +174,7 @@ class GatedResidual(JaxModule):
         proj = jnp.einsum(
             "TD,DK->TK",
             xn.astype(jnp.float32),
-            self.down_block_inject.kernel.value.astype(jnp.float32),
+            self.down_block_inject.weight.value.astype(jnp.float32),
         )
         lora = proj[..., : self.hc_lowrank]
         inj = proj[..., self.hc_lowrank : self.hc_lowrank + self.hc_count]
@@ -182,7 +182,7 @@ class GatedResidual(JaxModule):
         gate = jnp.einsum(
             "TD,DK->TK",
             lora,
-            self.up.kernel.value.astype(jnp.float32),
+            self.up.weight.value.astype(jnp.float32),
         )
         gate = gate.reshape(*hyper.shape[:-1], self.hc_count, self.hidden_size)
         xn_r = xn.reshape(*hyper.shape[:-1], self.hc_count, self.hidden_size).astype(

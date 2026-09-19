@@ -56,6 +56,8 @@ except ImportError:  # pragma: no cover
     class JaxModule(nnx.Module):  # type: ignore[no-redef]
         pass
 
+from ._jax_compat import JaxEinsum, JaxEmbed
+
 _init = nnx.initializers.uniform()
 MASK64 = (1 << 64) - 1
 
@@ -289,19 +291,24 @@ class Qwen4ExpPLE(JaxModule):
         # Per-head rows of width head_dim; heads are concatenated (flatten)
         # to [T, ple_embed_dim], matching upstream
         # ``ngram_embedding(ngram_ids).flatten(-2)``.
-        self.embedding = nnx.Embed(
+        self.embedding = JaxEmbed(
             num_embeddings=total_rows,
             features=self.head_dim,
             param_dtype=jnp.float32,
             embedding_init=nnx.with_partitioning(_init, ("model", None)),
             rngs=rngs,
+            prefix=prefix + ".embedding",
         )
         wide = hidden_size * hc_count
-        # Merged kv_proj: [ple_embed_dim] -> [HC*H + H].
-        self.kv_proj = nnx.Einsum(
+        # Merged kv: [ple_embed_dim] -> [HC*H + H]. NOTE: attribute is ``kv``
+        # (not ``kv_proj``): "kv_proj" contains the loader heuristic
+        # substring "v_proj", which would route it into the 3D k/v path and
+        # crash construction. JAX name: ``...ple.kv.weight``.
+        self.kv = JaxEinsum(
             "TD,DK->TK", (ple_embed_dim, wide + hidden_size),
             param_dtype=jnp.float32,
-            kernel_init=nnx.with_partitioning(_init, (None, "model")), rngs=rngs)
+            kernel_init=nnx.with_partitioning(_init, (None, "model")), rngs=rngs,
+            prefix=prefix + ".kv")
         self.norm_key_w = nnx.Param(jnp.zeros((wide,), dtype=jnp.float32))
         self.norm_query_w = nnx.Param(jnp.zeros((wide,), dtype=jnp.float32))
         self.norm_conv_w = nnx.Param(jnp.zeros((wide,), dtype=jnp.float32))
@@ -379,7 +386,7 @@ class Qwen4ExpPLE(JaxModule):
         emb = e.astype(hidden_hc.dtype)
         kv = jnp.einsum(
             "TD,DK->TK", emb.astype(jnp.float32),
-            self.kv_proj.kernel.value.astype(jnp.float32)).astype(hidden_hc.dtype)
+            self.kv.weight.value.astype(jnp.float32)).astype(hidden_hc.dtype)
         gated, conv_in = self.gate(hidden_hc, kv)
         # Upstream accumulates the dilated short-conv of conv_in directly
         # into the multi-stream state (see ple_conv kernel).

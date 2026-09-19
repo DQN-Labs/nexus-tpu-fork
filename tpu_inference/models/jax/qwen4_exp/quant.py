@@ -131,9 +131,69 @@ def dequantize_q4_packed(
     return w.astype(dtype)
 
 
+def dequantize_gptq_torch(qweight, qzeros, scales, g_idx, *, bits=4,
+                          group_size=128):
+    """CPU dequant of one GPTQModel-v2 linear to float32 ``(in, out)``.
+
+    Exact inverse of GPTQModel ``pack_block`` (low-nibble-first int32
+    packing, zeros stored directly, ``W = scales[g] * (codes - zeros[g])``;
+    verified against ``gptqmodel/nn_modules/qlinear/{__init__.py,torch.py}``).
+    Pinned contract: INT4, group 128, asymmetric (zeros kept),
+    ``DescAct=False`` — but ``g_idx`` is honored as stored, so any order
+    works. Raises ``ValueError`` with shapes on any layout mismatch (fail
+    fast in the server log rather than silently mis-loading).
+    """
+    import torch
+
+    if bits not in (2, 4, 8):
+        raise ValueError(f"GPTQ dequant supports bits 2/4/8, got {bits}")
+    pack = 32 // bits
+    maxq = (1 << bits) - 1
+    qw = qweight.to(torch.int32)
+    if qw.ndim != 2:
+        raise ValueError(f"qweight must be 2D, got {tuple(qw.shape)}")
+    in_packed, out = qw.shape
+    shifts = (torch.arange(pack, dtype=torch.int32) * bits).view(1, pack, 1)
+    codes = (torch.bitwise_right_shift(
+        qw.unsqueeze(1).expand(-1, pack, -1), shifts) & maxq).to(torch.float32)
+    codes = codes.reshape(in_packed * pack, out)
+    if scales.ndim != 2:
+        raise ValueError(f"scales must be 2D, got {tuple(scales.shape)}")
+    num_groups, scales_out = scales.shape
+    if scales_out != out:
+        raise ValueError(
+            f"scales out dim {scales_out} != qweight out dim {out}")
+    qz = qzeros.to(torch.int32)
+    if qz.ndim != 2 or qz.shape[0] != num_groups:
+        raise ValueError(
+            f"qzeros shape {tuple(qz.shape)} incompatible with "
+            f"{num_groups} groups x {out} out")
+    zshifts = (torch.arange(pack, dtype=torch.int32) * bits).view(1, 1, pack)
+    zeros = (torch.bitwise_right_shift(
+        qz.unsqueeze(2).expand(-1, -1, pack), zshifts) & maxq).to(torch.float32)
+    zeros = zeros.reshape(num_groups, -1)[:, :out]
+    g = g_idx.reshape(-1).to(torch.long)
+    in_features = int(g.numel())
+    if codes.shape[0] < in_features:
+        raise ValueError(
+            f"unpacked rows {codes.shape[0]} < g_idx len {in_features}")
+    codes = codes[:in_features]
+    if group_size != -1 and in_features // group_size != num_groups:
+        raise ValueError(
+            f"in_features {in_features} // group_size {group_size} != "
+            f"{num_groups} scale groups")
+    if int(g.min()) < 0 or int(g.max()) >= num_groups:
+        raise ValueError(
+            f"g_idx range [{int(g.min())}, {int(g.max())}] outside "
+            f"{num_groups} groups")
+    s = scales.to(torch.float32)
+    return s[g] * (codes - zeros[g])
+
+
 __all__ = [
     "IGNORED_MISSING_SUFFIXES",
     "QUANT_SKIP_SUBSTR",
+    "dequantize_gptq_torch",
     "dequantize_q4_packed",
     "should_skip_quant",
 ]

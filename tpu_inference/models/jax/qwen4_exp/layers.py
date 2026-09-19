@@ -254,8 +254,7 @@ class Qwen4ExpDecoderLayer(JaxModule):
         o = sparse_gqa(q, k_full, v_full, tok_idx, counts, N, Kv)
         if gate is not None:
             o = o * jax.nn.sigmoid(gate.astype(jnp.float32)).astype(o.dtype)
-        w_o = self.self_attn.o_proj.kernel.value.astype(jnp.float32).reshape(
-            N, D, H)
+        w_o = self.self_attn.o_proj.weight.value.astype(jnp.float32)
         return jnp.einsum("TNH,NHD->TD", o.astype(jnp.float32), w_o).astype(
             block_in.dtype)
 

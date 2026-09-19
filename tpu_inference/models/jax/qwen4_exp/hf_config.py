@@ -81,6 +81,21 @@ def _build_config_classes() -> tuple[Any, Any]:
             # attribute must already exist (v46 died here).
             self.text_config = text_config
             super().__init__(**kwargs)
+            # GPTQ bypass (v48: "auto_gptq quantization is currently not
+            # supported in tpu"): vLLM instantiates its CUDA-only GPTQ path
+            # from EITHER --quantization gptq OR the checkpoint's
+            # quantization_config. We serve GPTQ weights via JAX-side CPU
+            # dequant at load (weight_loader), so both triggers are removed:
+            # serve_prod.py passes no --quantization flag, and the config
+            # entry is neutralized here (original stashed for reference).
+            for cfg_obj in (self, text_config):
+                qc = getattr(cfg_obj, "quantization_config", None)
+                if isinstance(cfg_obj, PretrainedConfig) and qc is not None:
+                    try:
+                        cfg_obj.qwen4exp_quantization_config = qc
+                        delattr(cfg_obj, "quantization_config")
+                    except (AttributeError, TypeError):
+                        pass
 
         def get_text_config(self, *args: Any, **kwargs: Any) -> Any:
             # __dict__ lookup: recursion-proof against the custom

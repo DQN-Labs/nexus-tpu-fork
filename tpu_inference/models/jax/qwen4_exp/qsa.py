@@ -60,6 +60,7 @@ except ImportError:  # pragma: no cover
     class JaxModule(nnx.Module):  # type: ignore[no-redef]
         pass
 
+from ._jax_compat import JaxEinsum
 from .attention import apply_partial_rope, gemma_rmsnorm_last_dim
 
 _init = nnx.initializers.uniform()
@@ -99,12 +100,16 @@ class QSAIndexer(JaxModule):
         self.indexer_compress_ratio = indexer_compress_ratio
         self.prefix = prefix
         rngs = rngs or nnx.Rngs(0)
-        self.index_qk_proj = nnx.Einsum(
+        # NOTE: attribute is ``index_qk`` (not ``index_qk_proj``):
+        # "index_qk_proj" contains the loader heuristic substring "k_proj",
+        # which would route it into the 3D k/v path and crash construction.
+        self.index_qk = JaxEinsum(
             "TD,DK->TK",
             (hidden_size, (indexer_n_heads + 1) * indexer_head_dim),
             param_dtype=jnp.float32,
             kernel_init=nnx.with_partitioning(_init, (None, "model")),
             rngs=rngs,
+            prefix=prefix + ".index_qk",
         )
         self.q_norm_w = nnx.Param(jnp.zeros((indexer_head_dim,), dtype=jnp.float32))
         self.k_norm_w = nnx.Param(jnp.zeros((indexer_head_dim,), dtype=jnp.float32))
@@ -128,7 +133,7 @@ class QSAIndexer(JaxModule):
         fused = jnp.einsum(
             "TD,DK->TK",
             hidden.astype(jnp.float32),
-            self.index_qk_proj.kernel.value.astype(jnp.float32),
+            self.index_qk.weight.value.astype(jnp.float32),
         )
         q_raw = fused[..., : self.n_heads * self.head_dim].reshape(
             *hidden.shape[:-1], self.n_heads, self.head_dim
