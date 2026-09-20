@@ -185,17 +185,25 @@ class Qwen4ExpGDN(JaxModule):
             + jnp.exp(self.A_log.value.astype(jnp.float32))
         )  # [V] in (0,1)
         s = jnp.zeros((n_v, d_k, d_v), dtype=jnp.float32)
-        outs = []
-        for t in range(q.shape[0]):
-            beta = jax.nn.sigmoid(b[t]).astype(jnp.float32)  # [V]
-            kk = jnp.repeat(k[t].astype(jnp.float32), reps, axis=0)  # [V, Dk]
-            vv = v[t].astype(jnp.float32)  # [V, Dv]
+        # lax.scan (not a Python loop): unrolling T steps explodes compile
+        # time on long prefills; scan compiles the recurrence once.
+        # NOTE: argument order is (carry, step-inputs), NOT (step, carry).
+        def _step(s, qkvb):
+            qt, kt, vt, bt = qkvb
+            beta = jax.nn.sigmoid(bt).astype(jnp.float32)  # [V]
+            kk = jnp.repeat(kt.astype(jnp.float32), reps, axis=0)  # [V, Dk]
+            vv = vt.astype(jnp.float32)  # [V, Dv]
             update = jnp.einsum("HD,HV->HDV", kk, vv)  # [V, Dk, Dv]
             s = s * decay[:, None, None] + update * beta[:, None, None]
-            qt = jnp.repeat(q[t].astype(jnp.float32), reps, axis=0)  # [V, Dk]
-            o = jnp.einsum("HD,HDV->HV", qt, s)  # [V, Dv]
-            outs.append(o.reshape(-1))
-        return jnp.stack(outs).astype(q.dtype)
+            qr = jnp.repeat(qt.astype(jnp.float32), reps, axis=0)  # [V, Dk]
+            o = jnp.einsum("HD,HDV->HV", qr, s)  # [V, Dv]
+            return s, o.reshape(-1)
+
+        _, outs = jax.lax.scan(
+            _step, s,
+            (q.astype(jnp.float32), k.astype(jnp.float32),
+             v.astype(jnp.float32), b))
+        return outs.astype(q.dtype)
 
     def __call__(
         self,

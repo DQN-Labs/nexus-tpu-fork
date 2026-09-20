@@ -192,6 +192,56 @@ def test_qsa_slot_rules_and_select():
 
 
 @requires_impl
+def test_qsa_select_exact_and_jits():
+    """Hand-computed selection (order, dedup, truncation) + g==0 branch,
+    plus jit traceability (the serving requirement)."""
+    import jax
+
+    from tpu_inference.models.jax.qwen4_exp import qsa as qsa_mod
+    # structural properties on random scores (order/dedup covered by the
+    # compaction construction) + exact g==0 branch.
+    rng = np.random.default_rng(1)
+    qr = jnp.asarray(rng.normal(size=(4, 2, 4)), dtype=jnp.float32)
+    kcr = jnp.asarray(rng.normal(size=(5, 4)), dtype=jnp.float32)
+    posr = jnp.asarray([3, 6, 9, 12], dtype=jnp.int32)
+    idx, counts = qsa_mod.qsa_select_indices(qr, kcr, posr, 4, 8)
+    assert idx.shape == (4, 11)
+    for r in range(4):
+        c = int(counts[r])
+        assert 0 < c <= 11
+        row = np.asarray(idx[r, :c])
+        assert bool(np.all(row >= 0)) and len(set(row.tolist())) == c
+        assert bool(np.all(row <= int(posr[r])))
+        assert bool(np.all(np.asarray(idx[r, c:]) == -1))
+    # forced exact cases (top-k set independent of score order)
+    q1 = jnp.ones((1, 2, 4), dtype=jnp.float32)
+    idx1, counts1 = qsa_mod.qsa_select_indices(
+        q1, jnp.ones((1, 4), dtype=jnp.float32),
+        jnp.asarray([0], dtype=jnp.int32), 2, 2)
+    np.testing.assert_array_equal(np.asarray(idx1), np.asarray([[0, -1, -1]]))
+    np.testing.assert_array_equal(np.asarray(counts1), np.asarray([1]))
+    idx2, counts2 = qsa_mod.qsa_select_indices(
+        q1, jnp.ones((2, 4), dtype=jnp.float32),
+        jnp.asarray([3], dtype=jnp.int32), 2, 4)
+    np.testing.assert_array_equal(
+        np.asarray(idx2), np.asarray([[0, 1, 2, 3, -1]]))
+    np.testing.assert_array_equal(np.asarray(counts2), np.asarray([4]))
+    # empty-history branch is exact
+    q0 = jnp.ones((2, 2, 4), dtype=jnp.float32)
+    idx0, counts0 = qsa_mod.qsa_select_indices(
+        q0, jnp.zeros((0, 4), dtype=jnp.float32),
+        jnp.asarray([2, 5], dtype=jnp.int32), 2, 4)
+    np.testing.assert_array_equal(
+        np.asarray(idx0),
+        np.asarray([[-1, -1, 0, 1, 2], [1, 2, 3, 4, 5]]))
+    np.testing.assert_array_equal(np.asarray(counts0), np.asarray([3, 5]))
+    # traces under jit
+    fj = jax.jit(lambda a, b, c: qsa_mod.qsa_select_indices(a, b, c, 4, 8))
+    idxj, _ = fj(qr, kcr, posr)
+    np.testing.assert_array_equal(np.asarray(idxj), np.asarray(idx))
+
+
+@requires_impl
 def test_ple_hash_deterministic_and_shaped():
     m1 = ngram_mod.ple_multipliers(1234, 0, 3, 1000)
     m2 = ngram_mod.ple_multipliers(1234, 0, 3, 1000)
@@ -200,17 +250,23 @@ def test_ple_hash_deterministic_and_shaped():
     m_big = ngram_mod.ple_multipliers(1234, 0, 3, 10_000_000)
     assert all(0 < v < (1 << 63) for v in m_big)
     sizes, offsets = ngram_mod.ple_vocab_sizes_offsets(3, 2, 1000, 8)
-    assert sizes.shape == (4,) and offsets.shape == (4,)
+    # Plain Python ints (trace-safe construction): convert at the boundary.
+    assert isinstance(sizes, list) and len(sizes) == 4
+    assert offsets == [0, sizes[0], sizes[0] + sizes[1],
+                       sizes[0] + sizes[1] + sizes[2]]
+    assert ngram_mod.ple_padded_rows(sizes, 8) % 8 == 0
     # Layer-1 heads continue the global prime sequence (no overlap w/ layer 0).
     sizes1, _ = ngram_mod.ple_vocab_sizes_offsets(3, 2, 1000, 8,
                                                  ple_dense_layer_id=1)
-    assert not bool(jnp.any(sizes1 == sizes))
+    assert set(sizes1).isdisjoint(sizes)
+    _sizes = jnp.asarray(sizes, dtype=jnp.int32)
+    _offsets = jnp.asarray(offsets, dtype=jnp.int32)
     ids = ngram_mod.compute_ngram_ids(
         jnp.asarray([5, 6, 7], dtype=jnp.int32),
         jnp.asarray([0, 3], dtype=jnp.int32),
         jnp.zeros((1, 2), dtype=jnp.int32),
         jnp.zeros((3,), dtype=jnp.int32),
-        sizes, offsets, ngram_mod.ple_multipliers(1234, 0, 3, 1000), 3)
+        _sizes, _offsets, ngram_mod.ple_multipliers(1234, 0, 3, 1000), 3)
     assert ids.shape == (3, 4)
     assert bool(jnp.all(ids >= 0))
 
@@ -313,8 +369,86 @@ def test_hc_combine_matches_reference(mesh):
 
 
 @requires_impl
+def test_ngram_ids_vectorized_matches_reference_and_jits():
+    """Vectorized compute_ngram_ids == eager Python reference (bit-exact),
+    on multi-request + cross-chunk-context inputs, and compiles under jit."""
+    import jax
+
+    _MASK64 = (1 << 64) - 1
+
+    def _ref(input_ids, query_start_loc, ngram_context, token_to_req,
+             sizes, offsets, multipliers, ngram_size, eos_id=0):
+        toks = [int(v) for v in list(input_ids.reshape(-1))]
+        qsl = [int(v) for v in list(query_start_loc.reshape(-1))]
+        t2r = [int(v) for v in list(token_to_req.reshape(-1))]
+        ctx = [[int(v) for v in list(row)]
+               for row in list(ngram_context.reshape(
+                   ngram_context.shape[0], -1))]
+        sizes_l = [int(v) for v in list(sizes.reshape(-1))]
+        offs_l = [int(v) for v in list(offsets.reshape(-1))]
+        out_rows = []
+        for pos in range(int(input_ids.shape[0])):
+            req = t2r[pos]
+            seq_start = 0
+            for b in range(len(qsl) - 1):
+                if qsl[b] <= pos < qsl[b + 1]:
+                    seq_start = qsl[b]
+                    break
+            hist = []
+            for back in range(ngram_size):
+                p = pos - back
+                if p >= seq_start:
+                    hist.append(toks[p])
+                else:
+                    need = back - (pos - seq_start)
+                    crow = ctx[req] if 0 <= req < len(ctx) else []
+                    hist.append(crow[len(crow) - need]
+                                if 0 < need <= len(crow) else eos_id)
+            row = []
+            for order in range(2, int(ngram_size) + 1):
+                val = 0
+                for i in range(order):
+                    val = (val ^ ((hist[i] & _MASK64)
+                                  * (multipliers[i] & _MASK64))) & _MASK64
+                base_h = (order - 2) * 2
+                for h in range(2):
+                    row.append((val % sizes_l[base_h + h]) + offs_l[base_h + h])
+            out_rows.append(row)
+        return jnp.asarray(out_rows, dtype=jnp.int32)
+
+    rng = np.random.default_rng(0)
+    sizes = jnp.asarray([101, 103, 107, 109], dtype=jnp.int32)
+    offsets = jnp.asarray([0, 101, 204, 311], dtype=jnp.int32)
+    mults = ngram_mod.ple_multipliers(1234, 0, 3, 1000)
+    cases = [
+        (jnp.asarray([5, 6, 7, 1, 2, 3, 4, 9]),
+         jnp.asarray([0, 3, 8]), jnp.zeros((2, 2), dtype=jnp.int32),
+         jnp.asarray([0, 0, 0, 1, 1, 1, 1, 1])),
+        (jnp.asarray(rng.integers(0, 999, size=7), dtype=jnp.int32),
+         jnp.asarray([0, 2, 7]),
+         jnp.asarray(rng.integers(0, 999, size=(2, 2)), dtype=jnp.int32),
+         jnp.asarray([0, 0, 1, 1, 1, 1, 1])),
+    ]
+    for toks, qsl, ctx, t2r in cases:
+        ref = _ref(toks, qsl, ctx, t2r, sizes, offsets, mults, 3)
+        got = ngram_mod.compute_ngram_ids(toks, qsl, ctx, t2r, sizes,
+                                          offsets, mults, 3)
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+    # traces under jit (the serving requirement)
+    f = jax.jit(lambda a, b, c, d: ngram_mod.compute_ngram_ids(
+        a, b, c, d, sizes, offsets, mults, 3))
+    toks, qsl, ctx, t2r = cases[1]
+    out = f(toks, qsl, ctx, t2r)
+    np.testing.assert_array_equal(
+        np.asarray(out),
+        np.asarray(_ref(toks, qsl, ctx, t2r, sizes, offsets, mults, 3)))
+
+
+@requires_impl
 def test_ple_ngram_per_order_isolation():
-    sizes, offsets = ngram_mod.ple_vocab_sizes_offsets(3, 2, 1000, 8)
+    _sizes, _offsets = ngram_mod.ple_vocab_sizes_offsets(3, 2, 1000, 8)
+    sizes = jnp.asarray(_sizes, dtype=jnp.int32)
+    offsets = jnp.asarray(_offsets, dtype=jnp.int32)
     mults = ngram_mod.ple_multipliers(1234, 0, 3, 1000)
     qsl = jnp.asarray([0, 4], dtype=jnp.int32)
     ctx = jnp.zeros((1, 2), dtype=jnp.int32)
@@ -332,6 +466,33 @@ def test_ple_ngram_per_order_isolation():
     np.testing.assert_array_equal(
         np.asarray(ids_a[3, :2]), np.asarray(ids_b[3, :2]))
     assert not np.array_equal(np.asarray(ids_a[1]), np.asarray(ids_b[1]))
+
+
+@requires_impl
+def test_dilated_conv_gather_matches_loop_and_jits():
+    """Gather-based dilated conv == reference per-token loop, and traces."""
+    import jax
+    from flax import nnx
+
+    from tpu_inference.models.jax.qwen4_exp.ngram import Qwen4ExpPLE
+    ple = Qwen4ExpPLE(hidden_size=8, hc_count=2, ple_embed_dim=8,
+                      ngram_size=3, heads_per_ngram=2, conv_kernel=2,
+                      unigram_vocab_size=256, rngs=nnx.Rngs(0))
+    x = jnp.asarray(np.random.default_rng(2).normal(size=(9, 16)),
+                    dtype=jnp.float32)
+    got = ple.dilated_conv(x)
+    w = np.asarray(ple.conv_w.value, dtype=np.float32)
+    xn = np.asarray(x, dtype=np.float32)
+    zero = np.zeros((16,), dtype=np.float32)
+    ref = np.stack([
+        w[:, 0] * xn[t] + w[:, 1] * (xn[t - 3] if t >= 3 else zero)
+        for t in range(9)], axis=0)
+    np.testing.assert_allclose(np.asarray(got),
+                               jax.nn.silu(ref).astype(np.float32),
+                               rtol=1e-5, atol=1e-6)
+    fj = jax.jit(lambda a: ple.dilated_conv(a))
+    np.testing.assert_allclose(np.asarray(fj(x)), np.asarray(got),
+                               rtol=1e-6)
 
 
 @requires_impl

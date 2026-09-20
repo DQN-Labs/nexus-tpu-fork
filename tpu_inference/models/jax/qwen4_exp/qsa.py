@@ -200,6 +200,7 @@ def qsa_select_indices(
     width = budget + compress_ratio - 1
     t = q.shape[0]
     g = kc_norm_rope.shape[0]
+    ratio = compress_ratio
 
     def score_row(qr):
         # qr: [H, D]; kc: [G, D]
@@ -208,51 +209,56 @@ def qsa_select_indices(
         return jnp.sum(jax.nn.relu(dots), axis=0)  # [G]
 
     if g == 0:
-        # Only causal tail visible.
-        idx = jnp.full((t, width), -1, dtype=jnp.int32)
-        counts = jnp.minimum(positions + 1, width)
-        for r in range(t):
-            c = int(jnp.minimum(positions[r] + 1, width))
-            idx = idx.at[r, :c].set(
-                jnp.arange(positions[r] - c + 1, positions[r] + 1)
-            )
-        return idx, counts
+        # Only causal tail visible. Slot j holds token pos-width+1+j when
+        # non-negative (trace-safe construction, no dynamic slices).
+        c = jnp.minimum(positions + 1, width)  # [T]
+        toks = positions[:, None] - width + 1 + jnp.arange(width)[None, :]
+        valid = jnp.arange(width)[None, :] >= (width - c)[:, None]
+        idx = jnp.where(valid, toks, -1).astype(jnp.int32)
+        return idx, c.astype(jnp.int32)
 
     scores = jax.vmap(score_row)(q)  # [T, G]
     # Causal visibility: block b covers tokens [b*ratio,(b+1)*ratio); visible
     # iff its first token <= query position.
-    block_first = jnp.arange(g) * compress_ratio
+    block_first = jnp.arange(g) * ratio
     visible = block_first[None, :] <= positions[:, None]
     scores = jnp.where(visible, scores, -jnp.inf)
     k = min(n_blocks, g)
     _, top_blocks = jax.lax.top_k(scores, k)  # [T, k]
     top_blocks = jnp.sort(top_blocks, axis=-1)
 
-    # Expand complete blocks; append causal tail of the open group.
-    idx = jnp.full((t, width), -1, dtype=jnp.int32)
-    counts = jnp.zeros((t,), dtype=jnp.int32)
-    for r in range(t):
-        pos = int(positions[r])
-        tail_start = (pos // compress_ratio) * compress_ratio
-        # Complete blocks strictly before the open group.
-        cols = []
-        for b in range(k):
-            blk = int(top_blocks[r, b])
-            if blk * compress_ratio >= tail_start and blk * compress_ratio + compress_ratio > pos + 1:
-                continue
-            if blk * compress_ratio > pos:
-                continue
-            for off in range(compress_ratio):
-                tok = blk * compress_ratio + off
-                if tok <= pos:
-                    cols.append(tok)
-        for tok in range(tail_start, pos + 1):
-            if tok not in cols:
-                cols.append(tok)
-        cols = cols[:width]
-        idx = idx.at[r, : len(cols)].set(jnp.asarray(cols, dtype=jnp.int32))
-        counts = counts.at[r].set(len(cols))
-    return idx, counts
+    # Expand complete blocks (block starts strictly before the open group;
+    # top_blocks is ascending so these form a prefix) then the causal tail
+    # ([tail_start..pos], minus tokens already covered). The eager version
+    # appends tail tokens in the same relative order; downstream softmax is
+    # order-invariant over the valid set, and counts match exactly.
+    tail_start = (positions // ratio) * ratio  # [T]
+    grid = top_blocks[:, :, None] * ratio + jnp.arange(ratio)[None, None, :]
+    grid_ok = (top_blocks * ratio)[:, :, None] < tail_start[:, None, None]
+    grid_ok = grid_ok & (grid <= positions[:, None, None])
+    flat_toks = grid.reshape(t, k * ratio)
+    flat_ok = grid_ok.reshape(t, k * ratio)
+    tail_toks = tail_start[:, None] + jnp.arange(ratio)[None, :]
+    tail_ok = tail_toks <= positions[:, None]
+    covered = jnp.any(
+        (tail_toks[:, :, None] == flat_toks[:, None, :])
+        & flat_ok[:, None, :],
+        axis=-1,
+    )
+    tail_keep = tail_ok & ~covered
+    toks = jnp.concatenate([flat_toks, tail_toks], axis=1)
+    valid = jnp.concatenate([flat_ok, tail_keep], axis=1)
+    m = toks.shape[1]
+    # Compact valid slots to the front (stable): invalid slots map to the
+    # spare slot M (same -1 value, no clobber), then truncate to width.
+    order = jnp.cumsum(valid.astype(jnp.int32), axis=1) - 1
+    safe_order = jnp.where(valid, order, m)
+    out = jnp.full((t, m + 1), -1, dtype=jnp.int32)
+    out = out.at[jnp.arange(t)[:, None], safe_order].set(
+        jnp.where(valid, toks, -1))
+    idx = out[:, :width]
+    counts = jnp.minimum(jnp.sum(valid.astype(jnp.int32), axis=1), width)
+    return idx, counts.astype(jnp.int32)
 
 
 def sparse_gqa(

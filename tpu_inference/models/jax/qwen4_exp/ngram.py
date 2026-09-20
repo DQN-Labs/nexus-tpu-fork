@@ -145,7 +145,7 @@ def ple_vocab_sizes_offsets(
     base: int,
     divisible_by: int,
     ple_dense_layer_id: int = 0,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> Tuple[List[int], List[int]]:
     """Per-head prime sizes + row offsets (exact upstream port).
 
     Upstream ``_make_vocab_layout``: for local head ``h``,
@@ -153,6 +153,12 @@ def ple_vocab_sizes_offsets(
     ``size = nth_prime_after(base - 1, global_h + 1)``. Offsets are the
     unpadded cumsum; the embedding table pads only the *total* up to
     ``divisible_by`` (trailing padding rows, never looked up).
+
+    Returns PLAIN PYTHON INT LISTS (not JAX arrays): sizes feed shape
+    computation (``ple_padded_rows`` -> ``nnx.Embed``), which must stay
+    concrete under ``nnx.eval_shape``/jit tracing (v54 died on
+    ``int(jnp.sum(...))``). Callers convert to arrays where values (not
+    shapes) are needed.
     """
     n_heads = (ngram_size - 1) * heads_per_ngram
     sizes_l = [
@@ -161,19 +167,106 @@ def ple_vocab_sizes_offsets(
         )
         for h in range(n_heads)
     ]
-    # int32 suffices (base ~2e7) and keeps JAX x64-disabled configs happy.
-    sizes = jnp.asarray(sizes_l, dtype=jnp.int32)
-    offsets = jnp.concatenate(
-        [jnp.zeros((1,), jnp.int32), jnp.cumsum(sizes)[:-1]]
-    )
-    return sizes, offsets
+    offsets_l = []
+    running = 0
+    for s in sizes_l:
+        offsets_l.append(running)
+        running += s
+    return sizes_l, offsets_l
 
 
-def ple_padded_rows(sizes: jnp.ndarray, divisible_by: int) -> int:
-    """Total embedding rows: ``ceil(sum(sizes) / div) * div`` (upstream)."""
-    total = int(jnp.sum(sizes))
+def ple_padded_rows(sizes, divisible_by: int) -> int:
+    """Total embedding rows: ``ceil(sum(sizes) / div) * div`` (upstream).
+
+    Pure Python (see above): must stay concrete under tracing.
+    """
+    total = int(sum(int(v) for v in list(sizes)))
     div = int(divisible_by)
     return ((total + div - 1) // div) * div
+
+
+_MASK32 = (1 << 32) - 1
+_MASK16 = (1 << 16) - 1
+
+
+def _u32_add3(x: jax.Array, y: jax.Array, z: jax.Array):
+    """Mod-2^32 sum of three u32 arrays + total carry (0..2).
+
+    All ops wrap-safe: each add's carry is detected by comparison.
+    """
+    s1 = x + y
+    c1 = (s1 < x).astype(jnp.uint32)
+    s2 = s1 + z
+    c2 = (s2 < s1).astype(jnp.uint32)
+    return s2, c1 + c2
+
+
+def _u64_mul(a_lo: jax.Array, a_hi: jax.Array,
+             b_lo: jax.Array, b_hi: jax.Array):
+    """Low 64 bits of a 64x64-bit product (u32 limb pairs, exact).
+
+    Operands as (lo, hi) u32 pairs; returns (lo, hi) u32 pair holding the
+    product mod 2**64. No 64-bit arithmetic anywhere (TPU x64-free).
+    """
+    a0 = a_lo & _MASK16
+    a1 = (a_lo >> 16) & _MASK16
+    a2 = a_hi & _MASK16
+    a3 = (a_hi >> 16) & _MASK16
+    b0 = b_lo & _MASK16
+    b1 = (b_lo >> 16) & _MASK16
+    b2 = b_hi & _MASK16
+    b3 = (b_hi >> 16) & _MASK16
+    # result limbs r0..r3 (16 bits each) with carry propagation.
+    # Discipline: the third arg of _u32_add3 is a genuine addend (the small
+    # incoming 2**16-granularity carry ``c``). A returned carry ``t`` counts
+    # 2**32-multiples and must NEVER be fed back as an addend (that was a
+    # real bug: silent +t poison); it is added to the outgoing count.
+    r0_full = a0 * b0
+    r0 = r0_full & _MASK16
+    c = r0_full >> 16
+    s, t = _u32_add3(a0 * b1, a1 * b0, c)
+    r1 = s & _MASK16
+    c = (s >> 16) + (t << 16)
+    s, t = _u32_add3(a0 * b2, a1 * b1, c)
+    s, t2 = _u32_add3(s, a2 * b0, 0)
+    t2 = t2 + t
+    r2 = s & _MASK16
+    c = (s >> 16) + (t2 << 16)
+    s, t = _u32_add3(a0 * b3, a1 * b2, c)
+    s, t2 = _u32_add3(s, a2 * b1, 0)
+    t2 = t2 + t
+    s, t3 = _u32_add3(s, a3 * b0, 0)
+    t3 = t3 + t2
+    r3 = s & _MASK16
+    lo = r0 | (r1 << 16)
+    hi = r2 | (r3 << 16)
+    _ = t3  # overflow past bit 64 is discarded (mod 2**64)
+    return lo, hi
+
+
+def _u64_mod(lo: jax.Array, hi: jax.Array, d: jax.Array) -> jax.Array:
+    """u64 (lo, hi) mod u32 d (requires d < 2**31; sizes qualify).
+
+    (hi * 2**32 + lo) % d via pow2 precomputation (overflow-safe doubling)
+    and Russian-peasant mulmod (adds stay < 2d). All u32 exact.
+    """
+    p = jnp.ones_like(d)
+    for _ in range(32):
+        dbl = p + p
+        p = jnp.where(dbl >= d, dbl - d, dbl)
+    # p == 2**32 % d (d < 2**31 keeps every double exact).
+    res = jnp.zeros_like(d)
+    a = hi % d
+    b = p
+    for _ in range(32):
+        odd = (b & 1) == 1
+        res = jnp.where(odd, res + a, res)
+        res = jnp.where(res >= d, res - d, res)
+        a = a + a
+        a = jnp.where(a >= d, a - d, a)
+        b = b >> 1
+    res = res + (lo % d)
+    return jnp.where(res >= d, res - d, res)
 
 
 def compute_ngram_ids(
@@ -181,60 +274,72 @@ def compute_ngram_ids(
     query_start_loc: jax.Array,  # [B+1] token offsets per sequence
     ngram_context: jax.Array,  # [R, ngram_size-1] history (EOS-padded)
     token_to_req: jax.Array,  # [T] request index per token
-    sizes: jax.Array,  # [H] per-head vocab sizes
-    offsets: jax.Array,  # [H] per-head row offsets
+    sizes: jax.Array,  # [H] per-head vocab sizes (< 2**31, int32)
+    offsets: jax.Array,  # [H] per-head row offsets (int32)
     multipliers: List[int],
     ngram_size: int,
     eos_id: int = 0,
 ) -> jax.Array:
-    """Exact n-gram hash ids [T, H] (int32).
+    """Exact n-gram hash ids [T, H] (int32), fully XLA-traceable.
 
-    Hash arithmetic uses Python ints (uint64 wrap) so the result is
-    bit-exact regardless of JAX x64 mode; only the final ids are JAX arrays.
+    Same math as the eager reference (per-order XOR-mix of
+    ``hist[i] * multipliers[i]`` mod 2**64, then ``% sizes + offsets``),
+    but expressed with static shapes/indices only: no ``int()`` on traced
+    values, no Python loops over data. The 64-bit hash is emulated with
+    u32 limb pairs (``_u64_mul``/``_u64_mod``) so the result is bit-exact
+    without requiring JAX x64 (unavailable/unsuitable on TPU).
+
+    ``ngram_size``/shapes must be static (they are: attributes/shapes).
     """
-    t = int(input_ids.shape[0])
-    n_heads = int(sizes.shape[0])
-    heads_per_ngram = n_heads // max(int(ngram_size) - 1, 1)
-    # Gather per-token history: current + previous ngram_size-1 tokens,
-    # with sequence-start clamping to EOS and cross-chunk ngram_context.
-    toks = [int(v) for v in list(input_ids.reshape(-1))]
-    qsl = [int(v) for v in list(query_start_loc.reshape(-1))]
-    t2r = [int(v) for v in list(token_to_req.reshape(-1))]
-    ctx = [[int(v) for v in list(row)] for row in list(ngram_context.reshape(
-        ngram_context.shape[0], -1))]
-    sizes_l = [int(v) for v in list(sizes.reshape(-1))]
-    offs_l = [int(v) for v in list(offsets.reshape(-1))]
-    out_rows = []
-    for pos in range(t):
-        req = t2r[pos]
-        seq_start = 0
-        for b in range(len(qsl) - 1):
-            if qsl[b] <= pos < qsl[b + 1]:
-                seq_start = qsl[b]
-                break
-        hist = []
-        for back in range(ngram_size):
-            p = pos - back
-            if p >= seq_start:
-                hist.append(toks[p])
-            else:
-                need = back - (pos - seq_start)  # 1-based into context tail
-                crow = ctx[req] if 0 <= req < len(ctx) else []
-                hist.append(crow[len(crow) - need] if 0 < need <= len(crow) else eos_id)
-        # Per-order mixing (upstream eager path): order n mixes only the
-        # first n history tokens and fills only that order's heads.
-        # torch.remainder semantics with positive divisor == Python % here.
-        row = []
-        for order in range(2, int(ngram_size) + 1):
-            val = 0
-            for i in range(order):
-                val = (val ^ ((hist[i] & MASK64) * (multipliers[i] & MASK64))) & MASK64
-            base_h = (order - 2) * heads_per_ngram
-            for h in range(heads_per_ngram):
-                hh = base_h + h
-                row.append((val % sizes_l[hh]) + offs_l[hh])
-        out_rows.append(row)
-    return jnp.asarray(out_rows, dtype=jnp.int32)
+    n = ngram_size
+    t = input_ids.shape[0]
+    n_heads = sizes.shape[0]
+    heads_per_ngram = n_heads // max(n - 1, 1)
+    n_ctx = ngram_context.shape[0]
+    pos = jnp.arange(t)
+    # Sequence start per token via the start-loc table (static search).
+    b = jnp.clip(
+        jnp.searchsorted(query_start_loc, pos, side="right") - 1, 0,
+        query_start_loc.shape[0] - 2)
+    seq_start = query_start_loc[b]
+    rel = pos - seq_start
+    req = jnp.clip(token_to_req, 0, max(n_ctx - 1, 0))
+    # History matrix [T, n]: current + previous tokens, else context tail.
+    backs = jnp.arange(n)
+    use_tok = backs[None, :] <= rel[:, None]
+    tok_idx = jnp.clip(pos[:, None] - backs[None, :], 0, max(t - 1, 0))
+    gathered_tok = input_ids[tok_idx]
+    need = backs[None, :] - rel[:, None]  # 1-based tail index (>=1 off-token)
+    crow = ngram_context[req]  # [T, n-1]
+    # Context row has n-1 entries; 1-based need -> index (n-1)-need.
+    ctx_idx = jnp.clip((n - 1) - need, 0, max(n - 2, 0))
+    gathered_ctx = jnp.take_along_axis(crow, ctx_idx, axis=1)
+    req_ok = (token_to_req >= 0) & (token_to_req < n_ctx)
+    gathered_ctx = jnp.where(req_ok[:, None], gathered_ctx, eos_id)
+    hist = jnp.where(use_tok, gathered_tok,
+                     gathered_ctx).astype(jnp.uint32)  # [T, n]
+    mults_lo = jnp.asarray([m & _MASK32 for m in multipliers],
+                           dtype=jnp.uint32)
+    mults_hi = jnp.asarray([(m >> 32) & _MASK32 for m in multipliers],
+                           dtype=jnp.uint32)
+    outs = []
+    for order in range(2, n + 1):
+        vlo = jnp.zeros((t,), dtype=jnp.uint32)
+        vhi = jnp.zeros((t,), dtype=jnp.uint32)
+        for i in range(order):
+            a_lo, a_hi = hist[:, i], jnp.zeros((t,), dtype=jnp.uint32)
+            p_lo, p_hi = _u64_mul(a_lo, a_hi, mults_lo[i], mults_hi[i])
+            vlo, vhi = vlo ^ p_lo, vhi ^ p_hi
+        base_h = (order - 2) * heads_per_ngram
+        d = sizes[base_h:base_h + heads_per_ngram].astype(jnp.uint32)
+        o = offsets[base_h:base_h + heads_per_ngram].astype(jnp.uint32)
+        r = _u64_mod(
+            jnp.broadcast_to(vlo[:, None], (t, heads_per_ngram)),
+            jnp.broadcast_to(vhi[:, None], (t, heads_per_ngram)),
+            jnp.broadcast_to(d[None, :], (t, heads_per_ngram)),
+        )
+        outs.append((r + o[None, :]).astype(jnp.int32))
+    return jnp.concatenate(outs, axis=1)
 
 
 class Qwen4ExpPLE(JaxModule):
@@ -347,6 +452,8 @@ class Qwen4ExpPLE(JaxModule):
     ) -> jax.Array:
         # Depthwise dilated conv1d, dilation=ngram_size, causal.
         # conv_in: [T, C]; weight [C, K] zero-init at start of training.
+        # Gather-based (no per-token Python loop): the loop unrolls T times
+        # under jit and explodes compile time on long prefills.
         w = self.conv_w.value.astype(jnp.float32)  # [C, K]
         k, dil = self.conv_kernel, self.ngram_size
         hist_len = (k - 1) * dil
@@ -356,13 +463,12 @@ class Qwen4ExpPLE(JaxModule):
             full = jnp.concatenate([hist[-hist_len:], conv_in.astype(jnp.float32)])
         else:
             full = jnp.pad(conv_in.astype(jnp.float32), ((hist_len, 0), (0, 0)))
-        outs = []
-        for t in range(conv_in.shape[0]):
-            acc = jnp.zeros((conv_in.shape[1],), dtype=jnp.float32)
-            for j in range(k):
-                acc = acc + w[:, j] * full[t + hist_len - j * dil, :]
-            outs.append(acc)
-        return jax.nn.silu(jnp.stack(outs)).astype(conv_in.dtype)
+        t = conv_in.shape[0]
+        rows = (jnp.arange(t)[:, None] + hist_len
+                - jnp.arange(k)[None, :] * dil)  # [T, K]
+        gather = full[rows]  # [T, K, C]
+        acc = jnp.einsum("CK,TKC->TC", w, gather)
+        return jax.nn.silu(acc).astype(conv_in.dtype)
 
     def __call__(
         self,
