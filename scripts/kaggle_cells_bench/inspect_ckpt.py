@@ -29,6 +29,13 @@ else:
         "vocab_size": arch.vocab_size,
     }
     print("arch parsed:", json.dumps(rep["arch"], indent=1)[:1200])
+    # Raw expert-dim keys (the JAX model is built from arch_from_hf_config;
+    # a missing/renamed moe_intermediate_size would silently build wrong
+    # expert shapes, so echo every candidate key verbatim).
+    rep["moe_keys"] = {k: text.get(k) for k in text
+                       if "inter" in k.lower() or "expert" in k.lower()
+                       or k in ("hidden_size", "num_hidden_layers")}
+    print("moe_keys:", json.dumps(rep["moe_keys"])[:600])
 
     # tensor names: prefer the index json (no file opens at all)
     names = []

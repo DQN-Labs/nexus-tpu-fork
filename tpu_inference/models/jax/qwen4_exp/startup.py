@@ -31,11 +31,57 @@ config registration must succeed and raises loudly if it cannot.
 from __future__ import annotations
 
 
+def _guard_qwix_null_quantization_config() -> None:
+    """Guard tpu-inference's qwix default-config probe against a nulled
+    quantization_config (v52 died here).
+
+    We null the checkpoint's quantization_config (via --hf-overrides, since
+    vLLM re-attaches it post-parse from the raw dict / hf_quant_config.json)
+    so vLLM never builds its CUDA-only quant path. But
+    ``get_default_qwix_quantization_config`` does
+    ``hf_config.quantization_config["quant_method"]`` guarded only by
+    ``hasattr`` — None passes hasattr and explodes on subscript. Patched
+    copy treats non-dict as absent (exact 0.28.0 semantics otherwise).
+    Best-effort: never break interpreter startup.
+    """
+    try:
+        from tpu_inference.models.jax.utils.qwix import (
+            qwix_utils as _qwix,
+        )
+    except Exception:
+        return
+    try:
+        _orig = _qwix.get_default_qwix_quantization_config
+
+        def _patched(hf_config, skip_quantization):
+            if skip_quantization:
+                return None
+            qc = getattr(hf_config, "quantization_config", None)
+            if not isinstance(qc, dict):
+                qc = None
+            model_type = getattr(hf_config, "model_type", None)
+            model_type = model_type.lower() \
+                if isinstance(model_type, str) else None
+            quant_method = qc.get("quant_method") \
+                if isinstance(qc, dict) else None
+            if model_type == "llama4" \
+                    and quant_method == "compressed-tensors":
+                return _qwix.DEFAULT_LLAMA4_FP8_CONFIG
+            if model_type == "gpt_oss" and quant_method == "mxfp4":
+                return _qwix.DEFAULT_GPT_OSS_FP4_CONFIG
+            return None
+
+        _qwix.get_default_qwix_quantization_config = _patched
+    except Exception:
+        pass
+
+
 def install() -> dict:
     """Install HF config mapping + JAX/vLLM model registration."""
     from .hf_config import install_hf_config
 
     install_hf_config()
+    _guard_qwix_null_quantization_config()
     try:
         from . import register
 

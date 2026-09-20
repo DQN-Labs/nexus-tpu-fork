@@ -851,6 +851,60 @@ def test_nvfp4_expert_assembly_and_dense_gaps():
 
 
 @requires_impl
+def test_qwix_guard_handles_nulled_quantization_config():
+    """v52: --hf-overrides nulls quantization_config (vLLM re-attaches it
+    post-parse); tpu-inference's probe subscripts it behind a bare hasattr
+    and explodes on None. The startup guard must make None behave as
+    absent while preserving the llama4/gpt_oss defaults."""
+    import sys
+    import types
+    from types import SimpleNamespace
+
+    from tpu_inference.models.jax.qwen4_exp import startup as startup_mod
+
+    fake = types.ModuleType("qwix_utils")
+
+    def _orig(hf_config, skip_quantization):
+        # exact 0.28.0 probe semantics (crashes on None)
+        if skip_quantization:
+            return None
+        return hf_config.quantization_config["quant_method"] if hasattr(
+            hf_config, "quantization_config") else None
+
+    fake.get_default_qwix_quantization_config = _orig
+    fake.DEFAULT_LLAMA4_FP8_CONFIG = {"llama": 1}
+    fake.DEFAULT_GPT_OSS_FP4_CONFIG = {"gptoss": 1}
+    chain = ["tpu_inference", "tpu_inference.models",
+             "tpu_inference.models.jax", "tpu_inference.models.jax.utils",
+             "tpu_inference.models.jax.utils.qwix"]
+    saved = {n: sys.modules.get(n) for n in chain
+             + ["tpu_inference.models.jax.utils.qwix.qwix_utils"]}
+    try:
+        for n in chain:
+            sys.modules[n] = types.ModuleType(n)
+        sys.modules["tpu_inference.models.jax.utils.qwix.qwix_utils"] = fake
+        startup_mod._guard_qwix_null_quantization_config()
+        probed = sys.modules[
+            "tpu_inference.models.jax.utils.qwix.qwix_utils" \
+        ].get_default_qwix_quantization_config
+        assert probed(SimpleNamespace(model_type="qwen4_exp",
+                                      quantization_config=None), False) is None
+        assert probed(SimpleNamespace(model_type="qwen4_exp"), False) is None
+        assert probed(SimpleNamespace(
+            model_type="llama4",
+            quantization_config={"quant_method": "compressed-tensors"}),
+            False) == {"llama": 1}
+        assert probed(SimpleNamespace(model_type="qwen4_exp",
+                                      quantization_config=None), True) is None
+    finally:
+        for n, m in saved.items():
+            if m is None:
+                sys.modules.pop(n, None)
+            else:
+                sys.modules[n] = m
+
+
+@requires_impl
 def test_hf_config_neutralizes_gptq(tmp_path):
     """vLLM must not see quantization_config (its CUDA-only GPTQ gate
     rejects TPU); the original is stashed, everything else preserved."""
