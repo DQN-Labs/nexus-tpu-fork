@@ -272,11 +272,45 @@ def dequantize_nvfp4_torch(weight_u8, weight_scale_fp8, global_scale,
     return sc * vals * gs
 
 
+# OCP E2M1 decode table (index = 4-bit code), shared by torch/JAX paths.
+_E2M1_LUT_F32 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                 -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def dequantize_nvfp4_jax(weight_u8, weight_scale_fp8, global_scale,
+                         *, group_size=16):
+    """JAX twin of :func:`dequantize_nvfp4_torch` (identical math).
+
+    Used for dequant-in-forward under NVFP4 HBM residency. Inputs are the
+    raw checkpoint dtypes (uint8 / fp8-e4m3 / fp32 scalar); output is
+    float32 ``(out, in)``. No x64, no data-dependent control flow.
+    """
+    out = weight_u8.shape[0]
+    in_features = weight_u8.shape[1] * 2
+    # Degenerate narrow linears (in < group_size) carry a single scale
+    # column; broadcast it (real exports always satisfy in >= group_size).
+    n_groups = max(1, in_features // group_size)
+    if tuple(weight_scale_fp8.shape) != (out, n_groups):
+        raise ValueError(
+            f"NVFP4 weight_scale shape {tuple(weight_scale_fp8.shape)} != "
+            f"({out}, {n_groups})")
+    lut = jnp.asarray(_E2M1_LUT_F32, dtype=jnp.float32)
+    w8 = weight_u8.astype(jnp.int32)
+    codes = jnp.stack([(w8 & 0xF), ((w8 >> 4) & 0xF)], axis=-1)
+    vals = lut[codes.reshape(out, in_features)]
+    sc = weight_scale_fp8.astype(jnp.float32)
+    blk = jnp.arange(in_features // 2) // max(1, group_size // 2)
+    sc = sc[:, blk].repeat(2, axis=1)
+    g = global_scale.reshape(()).astype(jnp.float32)
+    return sc * vals * g
+
+
 __all__ = [
     "IGNORED_MISSING_SUFFIXES",
     "QUANT_SKIP_SUBSTR",
     "dequantize_gptq_jax",
     "dequantize_gptq_torch",
+    "dequantize_nvfp4_jax",
     "dequantize_nvfp4_torch",
     "dequantize_q4_packed",
     "should_skip_quant",

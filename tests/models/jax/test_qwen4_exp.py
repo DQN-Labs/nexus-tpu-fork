@@ -272,6 +272,81 @@ def test_ple_hash_deterministic_and_shaped():
 
 
 @requires_impl
+def test_moe_triplet_forward_matches_fused_reference(mesh):
+    """Triplet MoE (selected-expert NVFP4 dequant) == fused fp32 math on
+    the same dequantized values; traces under jit."""
+    import jax
+    import torch
+    from flax import nnx
+
+    from tpu_inference.models.jax.qwen4_exp import quant as quant_mod
+    from tpu_inference.models.jax.qwen4_exp.moe import Qwen4ExpMoE, silu
+
+    torch.manual_seed(9)
+    H, I, E, K = 32, 16, 4, 2
+    LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5,
+           -2.0, -3.0, -4.0, -6.0)
+
+    def nvfp4_pack(Wtrue):
+        O, II = Wtrue.shape
+        G = II // 16
+        scales = torch.empty(O, G)
+        for j in range(G):
+            blk = Wtrue[:, j * 16:(j + 1) * 16].abs().max(dim=1).values
+            scales[:, j] = (blk / 6.0).clamp_min(1e-6)
+        scaled = Wtrue / scales[:, torch.arange(II) // 16]
+        dist = torch.stack([(scaled - v).abs() for v in LUT])
+        codes = dist.argmin(dim=0).to(torch.int32)
+        qw = (((codes[:, 0::2] & 0xF) | ((codes[:, 1::2] & 0xF) << 4))
+              .to(torch.uint8))
+        return qw, scales.to(torch.float8_e4m3fn), torch.tensor(1.0)
+
+    moe = Qwen4ExpMoE(hidden_size=H, moe_intermediate_size=I,
+                      shared_intermediate_size=0, num_experts=E,
+                      num_experts_per_tok=K, rngs=nnx.Rngs(0))
+    fused = {}
+    # Stack per-expert triplets exactly like the loader (gate_g is [E],
+    # not scalar: assigning a scalar would collapse the param shape).
+    buckets = {}
+    for e in range(E):
+        for p, (O, II) in (("gate", (I, H)), ("up", (I, H)),
+                            ("down", (H, I))):
+            Wt = torch.randn(O, II)
+            qw, sc, gs = nvfp4_pack(Wt)
+            buckets.setdefault(f"exp_{p}_w", []).append(qw.numpy())
+            buckets.setdefault(f"exp_{p}_sc", []).append(sc.float().numpy())
+            buckets.setdefault(f"exp_{p}_g", []).append(gs.numpy())
+            fused[(e, p)] = quant_mod.dequantize_nvfp4_torch(
+                qw, sc, gs, group_size=16).numpy()
+    for name, parts in buckets.items():
+        getattr(moe, name).value = jnp.asarray(np.stack(parts))
+    # router weights fixed for determinism
+    moe.gate.weight.value = jnp.asarray(
+        np.random.default_rng(4).normal(size=(H, E)).astype(np.float32))
+    x = jnp.asarray(np.random.default_rng(5).normal(size=(3, H)),
+                    dtype=jnp.float32)
+    out, _ = moe(x)
+    # fused reference with the same dequantized values
+    logits = np.asarray(x) @ np.asarray(moe.gate.weight.value)
+    top = np.argsort(-logits, axis=1)[:, :K]
+    wts = np.take_along_axis(logits, top, axis=1)
+    wts = wts / wts.sum(axis=1, keepdims=True)
+    ref = np.zeros((3, H), dtype=np.float32)
+    for t in range(3):
+        for k in range(K):
+            e = int(top[t, k])
+            g = fused[(e, "gate")].T
+            u = fused[(e, "up")].T
+            h = silu(np.asarray(x[t]) @ g) * (np.asarray(x[t]) @ u)
+            d = fused[(e, "down")].T
+            ref[t] += wts[t, k] * (h @ d)
+    np.testing.assert_allclose(np.asarray(out), ref, rtol=1e-4, atol=1e-3)
+    fj = jax.jit(lambda a: moe(a)[0])
+    # Eager-vs-jit XLA reassociation noise only (correctness pinned above).
+    np.testing.assert_allclose(np.asarray(fj(x)), np.asarray(out), rtol=1e-4)
+
+
+@requires_impl
 def test_moe_routing_normalization(mesh):
     from flax import nnx
 
@@ -711,7 +786,14 @@ def test_loader_heuristic_audit():
     assert any(n.endswith(".self_attn.qkv.weight") for n in names)
     assert any(n.endswith(".ple.kv.weight") for n in names)
     assert any(n.endswith(".indexer.index_qk.weight") for n in names)
-    assert any(n.endswith(".mlp.exp_gate_up") for n in names)
+    # NVFP4 triplets (direct-assign): present, fused fp32 gone
+    for s in ("exp_gate_w", "exp_gate_sc", "exp_gate_g",
+              "exp_up_w", "exp_up_sc", "exp_up_g",
+              "exp_down_w", "exp_down_sc", "exp_down_g"):
+        assert any(n.endswith(".mlp." + s) for n in names), s
+    assert not any(n.endswith(".mlp.exp_gate_up") for n in names)
+    assert not any(n.endswith(".mlp.exp_down") for n in names)
+    assert any(n.endswith(".ple.embedding.table_scale") for n in names)
 
 
 @requires_impl
@@ -929,6 +1011,28 @@ def test_nvfp4_dequant_reconstruction():
 
 
 @requires_impl
+def test_nvfp4_jax_matches_torch_bit_exact():
+    """JAX dequant-in-forward twin == CPU reference (bit-exact)."""
+    torch = pytest.importorskip("torch")
+    import jax.numpy as jnp
+
+    from tpu_inference.models.jax.qwen4_exp import quant as quant_mod
+
+    torch.manual_seed(5)
+    O, I, gs = 48, 64, 16
+    codes = torch.randint(0, 16, (O, I), dtype=torch.int32)
+    qw = (((codes[:, 0::2] & 0xF) | ((codes[:, 1::2] & 0xF) << 4))
+          .to(torch.uint8))
+    scales = (torch.rand(O, I // gs) * 0.4 + 0.05)
+    glob = torch.tensor(2.5)
+    ref = quant_mod.dequantize_nvfp4_torch(qw, scales, glob, group_size=gs)
+    got = quant_mod.dequantize_nvfp4_jax(
+        jnp.asarray(qw.numpy()), jnp.asarray(scales.numpy()),
+        jnp.asarray(glob.numpy()), group_size=gs)
+    np.testing.assert_array_equal(np.asarray(got), ref.numpy())
+
+
+@requires_impl
 def test_nvfp4_expert_assembly_and_dense_gaps():
     """NVFP4 experts + qkv concat + mixer zero-fill + table zeros."""
     torch = pytest.importorskip("torch")
@@ -975,27 +1079,47 @@ def test_nvfp4_expert_assembly_and_dense_gaps():
     # mixer down only (inject zero-filled): down rows = hc_lowrank = 4
     stream += [("model.hyper_connection_mixer.input_mix_weight_down.weight",
                 torch.randn(4, 64))]
-    # table shard (dropped, zero-filled)
-    stream += [("model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight",
-                torch.randn(10, 8))]
-    jax_names = ["model.layers.0.mlp.exp_gate_up",
-                 "model.layers.0.mlp.exp_down",
+    # table shards fp8 (concatenated in numeric order) + global scale
+    stream += [(f"model.layers.0.ple.ple_embedding.ngram_embedding.shard_{i}.weight",
+                torch.randint(0, 256, (5, 8), dtype=torch.uint8))
+               for i in range(3)]
+    stream += [("model.layers.0.ple.ple_embedding.ngram_embedding.weight_scale",
+                torch.tensor(0.5))]
+    jax_names = ["model.layers.0.mlp.exp_gate_w",
+                 "model.layers.0.mlp.exp_gate_sc",
+                 "model.layers.0.mlp.exp_gate_g",
+                 "model.layers.0.mlp.exp_up_w",
+                 "model.layers.0.mlp.exp_up_sc",
+                 "model.layers.0.mlp.exp_up_g",
+                 "model.layers.0.mlp.exp_down_w",
+                 "model.layers.0.mlp.exp_down_sc",
+                 "model.layers.0.mlp.exp_down_g",
                  "model.layers.0.self_attn.qkv.weight",
                  "model.hyper_connection_mixer.down_block_inject.weight",
-                 "model.layers.0.ple.embedding.weight"]
-    jax_shapes = {"model.layers.0.ple.embedding.weight": (10, 8)}
+                 "model.layers.0.ple.embedding.weight",
+                 "model.layers.0.ple.embedding.table_scale"]
     rep = {}
     out = dict(wl_mod.iter_jax_named_weights(
-        iter(stream), arch, jax_names, report=rep, jax_shapes=jax_shapes,
+        iter(stream), arch, jax_names, report=rep,
         nvfp4_group_size=16))
     assert rep["missing"] == [], rep["missing"]
     assert rep["unconsumed"] == [], rep["unconsumed"]
-    gu = out["model.layers.0.mlp.exp_gate_up"]
-    assert gu.shape == (32, 2, 32)
-    assert torch.allclose(gu[:, 0, :16], exp_true[(0, "gate_proj")].T, atol=0.6)
-    assert torch.allclose(gu[:, 1, 16:], exp_true[(1, "up_proj")].T, atol=0.6)
-    dn = out["model.layers.0.mlp.exp_down"]
-    assert dn.shape == (2, 16, 32)
+    direct = rep["direct_tensors"]
+    # raw triplets stacked per layer (exact dtypes preserved)
+    assert direct["model.layers.0.mlp.exp_gate_w"].shape == (2, 16, 16)
+    assert direct["model.layers.0.mlp.exp_gate_w"].dtype == torch.uint8
+    assert direct["model.layers.0.mlp.exp_gate_sc"].dtype == torch.float8_e4m3fn
+    assert direct["model.layers.0.mlp.exp_gate_g"].shape == (2,)
+    assert direct["model.layers.0.mlp.exp_down_w"].shape == (2, 32, 8)
+    assert torch.equal(direct["model.layers.0.mlp.exp_gate_w"][0],
+                       dict(stream)["model.layers.0.mlp.experts.0.gate_proj.weight"])
+    # triplet content dequantizes back (global scale 1.0 here)
+    from tpu_inference.models.jax.qwen4_exp import quant as quant_mod
+    g0 = quant_mod.dequantize_nvfp4_torch(
+        direct["model.layers.0.mlp.exp_gate_w"][0],
+        direct["model.layers.0.mlp.exp_gate_sc"][0],
+        direct["model.layers.0.mlp.exp_gate_g"][0], group_size=16)
+    assert torch.allclose(g0, exp_true[(0, "gate_proj")], atol=0.6)
     qkv = out["model.layers.0.self_attn.qkv.weight"]
     assert qkv.shape == (48, 32)
     d = dict(stream)
@@ -1007,8 +1131,15 @@ def test_nvfp4_expert_assembly_and_dense_gaps():
     assert torch.equal(mix[:4],
                        d["model.hyper_connection_mixer.input_mix_weight_down.weight"])
     assert bool((mix[4:] == 0).all())
-    assert bool((out["model.layers.0.ple.embedding.weight"] == 0).all())
-    assert any("zero-filled" in w for w in rep["warnings"])
+    # table concat (numeric shard order) + scalar scale
+    assert direct["model.layers.0.ple.embedding.weight"].shape == (15, 8)
+    assert torch.equal(
+        direct["model.layers.0.ple.embedding.weight"][:5],
+        d["model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"])
+    assert torch.equal(
+        direct["model.layers.0.ple.embedding.weight"][10:],
+        d["model.layers.0.ple.ple_embedding.ngram_embedding.shard_2.weight"])
+    assert direct["model.layers.0.ple.embedding.table_scale"].shape == torch.Size([])
 
 
 @requires_impl

@@ -58,6 +58,31 @@ except ImportError:  # pragma: no cover
 
 from ._jax_compat import JaxEinsum, JaxEmbed
 
+
+class PLEFp8Table(JaxModule):
+    """FP8 n-gram embedding table with dequant-on-lookup.
+
+    Params: ``weight`` fp8-e4m3 ``[rows, head_dim]`` + ``table_scale``
+    fp32 scalar (the export's single global ``weight_scale``). Forward
+    gathers rows, widens to fp32 exactly, and scales. Rows shard over the
+    ``model`` TP axis like a vocabulary embedding.
+    """
+
+    def __init__(self, num_embeddings: int, features: int, rngs=None,
+                 prefix: str = "") -> None:
+        self.num_embeddings = num_embeddings
+        self.features = features
+        self.prefix = prefix
+        rngs = rngs or nnx.Rngs(0)
+        del rngs  # values come from the checkpoint, never random
+        self.weight = nnx.Param(
+            jnp.zeros((num_embeddings, features), dtype=jnp.float8_e4m3fn))
+        self.table_scale = nnx.Param(jnp.zeros((), dtype=jnp.float32))
+
+    def __call__(self, ids: jax.Array) -> jax.Array:
+        rows = self.weight.value[ids]
+        return rows.astype(jnp.float32) * self.table_scale.value
+
 _init = nnx.initializers.uniform()
 MASK64 = (1 << 64) - 1
 
@@ -390,17 +415,17 @@ class Qwen4ExpPLE(JaxModule):
             ngram_size, heads_per_ngram, vocab_base, divisible_by,
             ple_dense_layer_id,
         )
-        self.sizes = jnp.asarray(sizes)
-        self.offsets = jnp.asarray(offsets)
+        self.sizes = jnp.asarray(sizes, dtype=jnp.int32)
+        self.offsets = jnp.asarray(offsets, dtype=jnp.int32)
         total_rows = ple_padded_rows(sizes, divisible_by)
-        # Per-head rows of width head_dim; heads are concatenated (flatten)
-        # to [T, ple_embed_dim], matching upstream
-        # ``ngram_embedding(ngram_ids).flatten(-2)``.
-        self.embedding = JaxEmbed(
+        # INT4-residency serving: the n-gram table (320M rows x head_dim,
+        # ~51 GB as fp8) lives in HBM as fp8 codes + one global fp32 scale
+        # and is dequantized per lookup. A full-precision copy (102-205 GB)
+        # cannot fit v5e-8 HBM alongside the body. JAX name stays
+        # ``...ple.embedding.weight`` (fp8) + ``...ple.embedding.table_scale``.
+        self.embedding = PLEFp8Table(
             num_embeddings=total_rows,
             features=self.head_dim,
-            param_dtype=jnp.float32,
-            embedding_init=nnx.with_partitioning(_init, ("model", None)),
             rngs=rngs,
             prefix=prefix + ".embedding",
         )

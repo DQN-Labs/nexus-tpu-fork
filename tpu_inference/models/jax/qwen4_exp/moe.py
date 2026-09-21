@@ -97,12 +97,13 @@ class Qwen4ExpMLP(JaxModule):
 class Qwen4ExpMoE(JaxModule):
     """Routed MoE + shared expert.
 
-    Checkpoint (per MoE layer ``mlp.``):
-    - ``gate.weight``: [num_experts, H]
-    - ``experts.gate_up_proj`` fused [E, 2*moe_inter, H] or split
-      ``gate_proj``/``up_proj`` + ``down_proj`` [E, H, moe_inter]
-    - ``shared_expert.gate_proj/up_proj/down_proj`` (+ optional
-      ``shared_expert_gate`` when fused — see ``maybe_fuse_shared_experts``).
+    INT4 HBM residency (v5e-8 cannot hold this MoE dequantized): experts
+    stay packed (ModelOpt NVFP4 layout) and only the top-k selected experts
+    per token are dequantized in-forward. Checkpoint (per MoE layer
+    ``mlp.``): ``gate.weight`` [E, H] plus per expert
+    ``experts.{e}.{gate,up,down}_proj`` x ``{weight u8, weight_scale fp8,
+    weight_scale_2 fp32 scalar}`` (``input_scale`` unused, activations stay
+    bf16). Shared expert is plain BF16 (``shared_expert.*_proj``).
     """
 
     def __init__(
@@ -130,14 +131,25 @@ class Qwen4ExpMoE(JaxModule):
             param_dtype=jnp.float32,
             kernel_init=nnx.with_partitioning(_init, (None, "model")), rngs=rngs,
             prefix=prefix + ".gate")
-        # Fused gate_up: [E, 2*I, H] stored as [2*I, E*H]-ish einsum kernel
-        # [H, E, 2I] for XLA-friendly gather.
-        self.exp_gate_up = nnx.Param(
-            jnp.zeros((hidden_size, num_experts, 2 * moe_intermediate_size),
-                      dtype=jnp.float32))
-        self.exp_down = nnx.Param(
-            jnp.zeros((num_experts, moe_intermediate_size, hidden_size),
-                      dtype=jnp.float32))
+        # NVFP4 triplets per projection (torch layout per expert row-block):
+        # gate/up: weight [E, I, H//2] u8, scales [E, I, H//16] fp8,
+        #   global [E] fp32; down: weight [E, H, I//2] u8,
+        #   scales [E, H, I//16] fp8, global [E] fp32.
+        i, h, e = moe_intermediate_size, hidden_size, num_experts
+        # Narrow-linears guard: degenerate (in < 16) projections carry a
+        # single scale column (real exports always satisfy in >= 16).
+        self.exp_gate_w = nnx.Param(jnp.zeros((e, i, h // 2), jnp.uint8))
+        self.exp_gate_sc = nnx.Param(
+            jnp.zeros((e, i, max(1, h // 16)), jnp.float8_e4m3fn))
+        self.exp_gate_g = nnx.Param(jnp.zeros((e,), jnp.float32))
+        self.exp_up_w = nnx.Param(jnp.zeros((e, i, h // 2), jnp.uint8))
+        self.exp_up_sc = nnx.Param(
+            jnp.zeros((e, i, max(1, h // 16)), jnp.float8_e4m3fn))
+        self.exp_up_g = nnx.Param(jnp.zeros((e,), jnp.float32))
+        self.exp_down_w = nnx.Param(jnp.zeros((e, h, i // 2), jnp.uint8))
+        self.exp_down_sc = nnx.Param(
+            jnp.zeros((e, h, max(1, i // 16)), jnp.float8_e4m3fn))
+        self.exp_down_g = nnx.Param(jnp.zeros((e,), jnp.float32))
         self.n_shared_experts = int(shared_intermediate_size > 0)
         if self.n_shared_experts:
             self.shared = Qwen4ExpMLP(hidden_size, shared_intermediate_size,
@@ -158,19 +170,33 @@ class Qwen4ExpMoE(JaxModule):
         self, x: jax.Array
     ) -> Tuple[jax.Array, jax.Array]:
         """Returns (output, router_logits) — logits for EPLB/aux-loss hooks."""
+        from .quant import dequantize_nvfp4_jax
+
         logits, weights, idx = self.route(x)  # [T,K]
         xf = x.astype(jnp.float32)
-        gu = self.exp_gate_up.value.astype(jnp.float32)  # [H, E, 2I]
-        dn = self.exp_down.value.astype(jnp.float32)  # [E, I, H]
-        # Gather per-token expert weights: [T, K, H, 2I] is too big for large
-        # E; gather only selected experts via take (dynamic gather, XLA-safe).
+        gw, gs, gg = (self.exp_gate_w.value, self.exp_gate_sc.value,
+                      self.exp_gate_g.value)
+        uw, us, ug = (self.exp_up_w.value, self.exp_up_sc.value,
+                      self.exp_up_g.value)
+        dw, ds, dg = (self.exp_down_w.value, self.exp_down_sc.value,
+                      self.exp_down_g.value)
+
+        def _deq(w, s, g):
+            return jax.vmap(dequantize_nvfp4_jax, in_axes=(0, 0, 0))(w, s, g)
+
+        # Gather + dequantize ONLY the selected experts (dynamic gather,
+        # XLA-safe; full dequant of all E experts per step would be ~250x
+        # the traffic on decode).
         def token_moe(xt, wt, idt):
-            g = jnp.take(gu, idt, axis=1)  # [H, K, 2I]
-            w = jnp.einsum("H,HKI->KI", xt, g)  # [K, 2I]
-            i = self.moe_inter
-            h = silu(w[:, :i]) * w[:, i:]
-            d = jnp.take(dn, idt, axis=0)  # [K, I, H]
-            o = jnp.einsum("KI,KIH->KH", h, d)  # [K, H]
+            g = _deq(jnp.take(gw, idt, axis=0), jnp.take(gs, idt, axis=0),
+                     jnp.take(gg, idt, axis=0))  # [K, I, H]
+            u = _deq(jnp.take(uw, idt, axis=0), jnp.take(us, idt, axis=0),
+                     jnp.take(ug, idt, axis=0))  # [K, I, H]
+            w = jnp.einsum("H,KIH->KI", xt, g)
+            h = silu(w) * jnp.einsum("H,KIH->KI", xt, u)
+            d = _deq(jnp.take(dw, idt, axis=0), jnp.take(ds, idt, axis=0),
+                     jnp.take(dg, idt, axis=0))  # [K, H, I]
+            o = jnp.einsum("KI,KIH->KH", h, d.transpose(0, 2, 1))  # [K, H]
             return jnp.sum(o * wt[:, None], axis=0)
 
         out = jax.vmap(token_moe)(xf, weights.astype(jnp.float32), idx)

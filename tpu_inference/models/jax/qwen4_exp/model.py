@@ -273,26 +273,44 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
         return self.model.embed_tokens.decode(hidden_states)
 
     def load_weights(self, weights) -> set:
-        """GPTQ-aware loading.
+        """Quantized-residency loading (NVFP4 primary, GPTQ fallback).
 
-        vLLM's CUDA-only auto_gptq path is bypassed (see weight_loader):
-        this wraps the raw checkpoint stream with CPU dequant + fused-param
-        assembly into JAX-named tensors, then delegates assignment to the
-        standard JAX auto-loader. Raises loudly on any unfilled JAX param.
+        vLLM's CUDA-only quant paths are bypassed (see weight_loader):
+        the iterator yields JAX-named tensors for the standard auto-loader
+        (dense BF16) and stashes quantized triplets + fp8 table in
+        ``report["direct_tensors"]`` for exact direct assignment here
+        (the auto-loader would transpose 2D tensors and cast dtypes).
+
+        Sharding metadata is set on every param BEFORE any assign:
+        without it, params land replicated and a 100B+-param MoE OOMs v5e-8
+        HBM during load (v56 died placing layer-1 experts).
+        Raises loudly on any unfilled JAX param.
         """
-        from .weight_loader import iter_jax_named_weights
+        from .weight_loader import (
+            iter_jax_named_weights,
+            sharding_spec_for,
+        )
         from tpu_inference.models.jax.utils.weight_utils import (
             JaxAutoWeightsLoader,
+            assign_and_shard_param,
         )
+        from tpu_inference.utils import t2j
 
         arch = self.model.arch
-        jax_names = [n for n, _ in self.named_parameters()]
-        jax_shapes = {n: tuple(p.value.shape)
-                      for n, p in self.named_parameters()}
+        named = dict(self.named_parameters())
+        jax_names = list(named)
+        mesh = getattr(self, "mesh", None)
+        for n, p in named.items():
+            try:
+                p.set_metadata("out_sharding",
+                               sharding_spec_for(n, p.value.shape))
+                if mesh is not None:
+                    p.set_metadata("mesh", mesh)
+            except Exception as e:  # noqa: BLE001 - report, don't break
+                print(f"LOAD-WARN sharding metadata {n}: {e}", flush=True)
         report: dict = {}
         gen = iter_jax_named_weights(
             iter(weights), arch, jax_names, report=report,
-            jax_shapes=jax_shapes,
             log=lambda m: print(m, flush=True))
         vcfg = getattr(self, "vllm_config", None)
         loader = JaxAutoWeightsLoader(
@@ -302,13 +320,23 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
                            if not hasattr(self, "lm_head") else None),
         )
         loaded = loader.load_weights(gen)
-        filled = set(report.get("filled", []))
-        missing = report.get("missing", [])
+        # Exact direct assignment (quantized triplets, fp8 table).
+        direct = report.get("direct_tensors", {}) or {}
+        for name, tensor in direct.items():
+            param = named.get(name)
+            if param is None:
+                raise RuntimeError(
+                    f"LOAD-FAIL direct target {name} matches no JAX param")
+            assign_and_shard_param(param, t2j(tensor), name)
+        filled = set(report.get("filled", [])) | set(direct)
+        missing = [m for m in report.get("missing", []) if m not in direct]
         unconsumed = report.get("unconsumed", [])
         summary = {
             "jax_params": len(jax_names),
             "filled": len(filled),
             "autoloader_loaded": sorted(loaded),
+            "direct": sorted(direct),
+            "direct_count": len(direct),
             "missing": missing,
             "missing_count": len(missing),
             "unconsumed_count": len(unconsumed),
@@ -319,7 +347,8 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
             "warnings": report.get("warnings", []),
         }
         print(f"LOAD-REPORT filled={len(filled)}/{len(jax_names)} "
-              f"dequant={summary['dequantized']} assembled={summary['assembled']} "
+              f"direct={len(direct)} dequant={summary['dequantized']} "
+              f"assembled={summary['assembled']} "
               f"missing={len(missing)} unconsumed={len(unconsumed)}",
               flush=True)
         for m in missing[:20]:

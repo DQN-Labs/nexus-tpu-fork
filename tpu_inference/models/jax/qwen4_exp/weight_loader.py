@@ -322,7 +322,9 @@ def expected_jax_names(arch):
         p = f"model.layers.{i}"
         lt = list(arch.layer_types)[i] if arch.layer_types else None
         if (i + 1) in ple_ids:
-            names += [f"{p}.ple.embedding.weight", f"{p}.ple.kv.weight",
+            names += [f"{p}.ple.embedding.weight",
+                      f"{p}.ple.embedding.table_scale",
+                      f"{p}.ple.kv.weight",
                       f"{p}.ple.norm_key_w", f"{p}.ple.norm_query_w",
                       f"{p}.ple.norm_conv_w", f"{p}.ple.conv_w"]
         if lt == "linear_attention":
@@ -341,8 +343,12 @@ def expected_jax_names(arch):
                           f"{p}.self_attn.indexer.q_norm_w",
                           f"{p}.self_attn.indexer.k_norm_w"]
         if is_moe_layer(arch, i):
-            names += [f"{p}.mlp.gate.weight",
-                      f"{p}.mlp.exp_gate_up", f"{p}.mlp.exp_down"]
+            names += [f"{p}.mlp.gate.weight"]
+            # NVFP4 triplets (direct-assign, exact dtypes, no transpose).
+            names += [f"{p}.mlp.{s}" for s in (
+                "exp_gate_w", "exp_gate_sc", "exp_gate_g",
+                "exp_up_w", "exp_up_sc", "exp_up_g",
+                "exp_down_w", "exp_down_sc", "exp_down_g")]
             if int(getattr(arch, "shared_expert_intermediate_size", 0) or 0) > 0:
                 names += [f"{p}.mlp.shared_expert.gate_proj.weight",
                           f"{p}.mlp.shared_expert.up_proj.weight",
@@ -415,6 +421,39 @@ def _maybe_bf16(jax_name, tensor):
 _NVFP4_KINDS = ("weight_scale", "weight_scale_2", "input_scale")
 
 
+def sharding_spec_for(jax_name, shape):
+    """TP sharding spec mirroring each param's init partitioning.
+
+    Without this, assign_and_shard_param places every param replicated
+    (spec ``()``), and a 100B+-param MoE OOMs v5e-8 HBM during load (v56
+    died placing layer-1 experts with 125 MB free). Triplets/table have no
+    init spec (plain zeros) and must shard explicitly.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    ndim = len(tuple(shape))
+    if ndim <= 1:
+        return P()
+    if ".o_proj.weight" in jax_name and ndim == 3:
+        return P("model", None, None)
+    if ".mlp.exp_" in jax_name:
+        # NVFP4 triplets [E, ...]: shard experts over TP axis (EP=1).
+        return P("model", *((None,) * (ndim - 1)))
+    if jax_name.endswith((".embed_tokens.weight",
+                           ".ple.embedding.weight")):
+        return P("model", None)
+    _ROW_PARALLEL = (".mlp.down_proj.weight",
+                     ".mlp.shared_expert.down_proj.weight",
+                     ".linear_attn.out_proj.weight")
+    if jax_name.endswith(_ROW_PARALLEL):
+        return P("model", None)
+    if jax_name.endswith(".up.weight"):
+        return P("model", None)
+    if jax_name.endswith("lm_head.weight"):
+        return P()  # in-tree parity (no init partitioning), 1.3 GB, fine
+    return P(None, "model") if ndim == 2 else P()
+
+
 def _is_table_tensor(mapped):
     """PLE n-gram table pieces (102 GB; host-side in phase 2, skipped here).
 
@@ -426,24 +465,27 @@ def _is_table_tensor(mapped):
 
 def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
                            bits=4, group_size=128, nvfp4_group_size=16,
-                           jax_shapes=None, table_fill="zero", log=None):
+                           log=None):
     """Yield ``(jax_name, torch_tensor)`` ready for JaxAutoWeightsLoader.
+
+    Quantized triplets (MoE NVFP4) and the fp8 PLE table bypass the
+    auto-loader (its 2D transpose would corrupt them) and are returned via
+    ``report["direct_tensors"]`` for exact direct assignment; ``report``
+    also carries ``filled``, ``missing``, ``unconsumed``, ``dropped``,
+    ``dequantized`` for the load report artifact.
 
     Args:
         weights: iterable of ``(ckpt_name, torch_tensor)`` (raw names).
         arch: Qwen4ExpArch (layer counts, experts, dims for assembly).
         jax_names: iterable of expected JAX param names (from the live
             model) — used to verify full coverage at the end.
-        report: dict filled with ``filled``, ``missing``, ``unconsumed``,
-            ``dropped``, ``dequantized`` for the load report artifact.
         bits/group_size: pinned GPTQ contract (INT4 / 128).
         nvfp4_group_size: ModelOpt NVFP4 block size (16).
-        jax_shapes: optional {jax_name: shape} from the live model; used to
-            zero-fill the (host-side, phase 2) PLE table + validate fusions.
         log: optional print-like sink.
 
-    The generator buffers only incomplete linear groups (a few tensors) and
-    per-layer expert accumulators; everything else streams through.
+    The generator buffers only incomplete linear groups (a few tensors),
+    per-layer expert accumulators, and table shards; everything else
+    streams through.
     """
     from .quant import dequantize_gptq_torch, dequantize_nvfp4_torch
 
@@ -629,13 +671,111 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
         filled.add(jax_name)
         return jax_name, _maybe_bf16(jax_name, tensor)
 
+    def _store_expert_nvfp4_raw(layer_base, expert_idx, proj, parts):
+        """Accumulate one expert's RAW NVFP4 shards (no dequant).
+
+        Returns [(jax_name, tensor)] with 9 layer-stacked triplets when all
+        E experts x 3 projs are complete, else None. Stacked (not fused):
+        gate/up ``_w [E,I,H//2] u8``, ``_sc [E,I,H//16]`` (stored dtype),
+        ``_g [E]`` fp32; down ``[E,H,I//2]`` etc. Shapes validated loudly.
+        """
+        import torch as _torch4
+
+        if expert_idx < 0 or expert_idx >= num_experts:
+            raise ValueError(
+                f"LOAD-FAIL {layer_base}: expert index {expert_idx} "
+                f"outside [0, {num_experts})")
+        w = parts["weight"]
+        sc = parts["weight_scale"]
+        g2 = parts["weight_scale_2"].reshape(-1)
+        if int(g2.numel()) != 1:
+            raise ValueError(
+                f"LOAD-FAIL {layer_base}: expert {proj} weight_scale_2 "
+                f"must be scalar, got {tuple(parts['weight_scale_2'].shape)}")
+        if proj in ("gate_proj", "up_proj"):
+            i, h2 = (int(d) for d in w.shape)
+            h = h2 * 2
+            if arch_hidden and h != arch_hidden:
+                raise ValueError(
+                    f"LOAD-FAIL {layer_base}: expert {proj} cols {h} != "
+                    f"arch hidden {arch_hidden}")
+            if arch_moe_inter and i != int(arch_moe_inter):
+                raise ValueError(
+                    f"LOAD-FAIL {layer_base}: expert {proj} rows {i} != "
+                    f"arch moe_intermediate {arch_moe_inter}")
+            if tuple(sc.shape) != (i, max(1, h // 16)):
+                raise ValueError(
+                    f"LOAD-FAIL {layer_base}: expert {proj} scales "
+                    f"{tuple(sc.shape)} != {(i, max(1, h // 16))}")
+        else:
+            h, i2 = (int(d) for d in w.shape)
+            i = i2 * 2
+            if arch_hidden and h != arch_hidden:
+                raise ValueError(
+                    f"LOAD-FAIL {layer_base}: expert {proj} rows {h} != "
+                    f"arch hidden {arch_hidden}")
+            if arch_moe_inter and i != int(arch_moe_inter):
+                raise ValueError(
+                    f"LOAD-FAIL {layer_base}: expert {proj} cols {i} != "
+                    f"arch moe_intermediate {arch_moe_inter}")
+            if tuple(sc.shape) != (h, max(1, i // 16)):
+                raise ValueError(
+                    f"LOAD-FAIL {layer_base}: expert {proj} scales "
+                    f"{tuple(sc.shape)} != {(h, max(1, i // 16))}")
+        acc = experts_nvfp4.setdefault(layer_base, {})
+        slot = acc.setdefault(proj, {})
+        slot[expert_idx] = (w, sc, g2.reshape(()).to(_torch4.float32))
+        if all(len(acc.get(p, {})) == num_experts
+               for p in ("gate_proj", "up_proj", "down_proj")) \
+                and not acc.get("done"):
+            acc["done"] = True
+            out = []
+            for proj, (wsuf, ssuf, gsuf) in (
+                    ("gate_proj", ("exp_gate_w", "exp_gate_sc",
+                                   "exp_gate_g")),
+                    ("up_proj", ("exp_up_w", "exp_up_sc", "exp_up_g")),
+                    ("down_proj", ("exp_down_w", "exp_down_sc",
+                                   "exp_down_g"))):
+                ws = _torch4.stack([acc[proj][e][0]
+                                    for e in range(num_experts)])
+                ss = _torch4.stack([acc[proj][e][1]
+                                    for e in range(num_experts)])
+                gs = _torch4.stack([acc[proj][e][2]
+                                    for e in range(num_experts)])
+                out += [(layer_base + "." + wsuf, ws.contiguous()),
+                        (layer_base + "." + ssuf, ss.contiguous()),
+                        (layer_base + "." + gsuf, gs.contiguous())]
+                del acc[proj]
+            del experts_nvfp4[layer_base]
+            rep["assembled"] += 1
+            return out
+        return None
+
     def _complete_dense(base, parts):
         """Flush one dense linear group.
 
         Returns (items, flushed): items is a list of (jax_name, tensor) to
-        yield; flushed False means incomplete (keep buffering).
+        yield; flushed False means incomplete (keep buffering). NVFP4
+        expert triplets and the fp8 table go to the direct-dict (exact
+        dtypes, no auto-loader transpose); everything else yields.
         """
+        import torch as _torch3
+
         out = []
+        exp = _is_expert_base(base)
+        if exp is not None and "weight" in parts \
+                and isinstance(parts["weight"], _torch3.Tensor) \
+                and parts["weight"].dtype == _torch3.uint8 \
+                and all(k in parts for k in ("weight_scale",
+                                             "weight_scale_2")):
+            layer_base, expert_idx, proj = exp
+            done = _store_expert_nvfp4_raw(layer_base, expert_idx, proj,
+                                           parts)
+            if done:
+                for jax_name, tensor in done:
+                    filled.add(jax_name)
+                    direct[jax_name] = tensor
+            return out, True
         piece, used_identity = _linear_piece(base, parts)
         if piece is None:
             return out, False  # incomplete: keep buffering
@@ -696,12 +836,19 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
     import re as _re
 
     jax_set = set(jax_names)
-    jax_shapes = dict(jax_shapes or {})
     assumed_identity = set()
     concat_accum = {}
     table_seen = []
+    table_bufs = {}
+    experts_nvfp4 = {}
+    direct = {}
     rep["warnings"] = []
     import torch as _torch
+    import re as _re2
+
+    def _table_layer(mapped):
+        m = _re2.search(r"\blayers\.(\d+)\.", mapped)
+        return int(m.group(1)) if m else None
 
     for raw_name, tensor in weights:
         if not isinstance(tensor, _torch.Tensor):
@@ -716,18 +863,29 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
             rep["dropped"][mapped] = rep["dropped"].get(mapped, 0) + 1
             continue
         if _is_table_tensor(mapped):
-            # 102 GB PLE table: never buffer values (host-side in phase 2).
-            # The JAX param is zero-filled at end of stream (neutral ablation;
-            # LOUD in warnings). Only shapes would matter; record kind counts.
+            # Buffer fp8 table shards + global scale (51 GB host transient);
+            # concatenated once at end of stream (numeric shard order).
+            li = _table_layer(mapped)
+            if li is None:
+                raise ValueError(
+                    f"LOAD-FAIL table tensor without layer index: {mapped}")
+            key = f"model.layers.{li}.ple.embedding"
+            buf = table_bufs.setdefault(
+                key, {"shards": {}, "scale": None, "seen": 0})
+            base, _, kind = mapped.rpartition(".")
+            if base.endswith(".weight_scale") or kind == "weight_scale":
+                if buf["scale"] is not None:
+                    raise ValueError(
+                        f"LOAD-FAIL duplicate table scale: {mapped}")
+                buf["scale"] = tensor
+            else:
+                m2 = _re2.search(r"shard_(\d+)", mapped)
+                if m2 is None:
+                    raise ValueError(
+                        f"LOAD-FAIL table shard without index: {mapped}")
+                buf["shards"][int(m2.group(1))] = tensor
+            buf["seen"] += 1
             table_seen.append(mapped.rpartition(".")[0])
-            rep["dropped"]["TABLE:" + mapped.rpartition(".")[2]] = \
-                rep["dropped"].get("TABLE:" + mapped.rpartition(".")[2], 0) + 1
-            continue
-        if _is_table_tensor(mapped):
-            # (duplicate guard: table pieces never reach other branches)
-            table_seen.append(mapped.rpartition(".")[0])
-            rep["dropped"]["TABLE:" + mapped.rpartition(".")[2]] = \
-                rep["dropped"].get("TABLE:" + mapped.rpartition(".")[2], 0) + 1
             continue
         if is_gptq_aux(mapped) or mapped.endswith(_NVFP4_KINDS):
             base, _, kind = mapped.rpartition(".")
@@ -821,6 +979,42 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
                 if isinstance(v, dict)}
         rep["unconsumed"].append(
             f"EXPERTS:{layer_base}={have}")
+    for layer_base in sorted(experts_nvfp4):
+        acc = experts_nvfp4[layer_base]
+        have = {k: (len(v) if isinstance(v, dict) else v)
+                for k, v in acc.items()}
+        rep["unconsumed"].append(
+            f"EXPERTS_NVFP4:{layer_base}={have}")
+    # PLE table: concat buffered fp8 shards (numeric order) + global scale.
+    for key in sorted(table_bufs):
+        buf = table_bufs[key]
+        idxs = sorted(buf["shards"])
+        if not idxs or idxs != list(range(min(idxs), max(idxs) + 1)):
+            raise ValueError(
+                f"LOAD-FAIL {key}: non-contiguous table shards "
+                f"({len(idxs)} pieces)")
+        if buf["scale"] is None:
+            raise ValueError(f"LOAD-FAIL {key}: table scale missing")
+        table = _torch.cat([buf["shards"][i] for i in idxs],
+                           dim=0).contiguous()
+        if int(buf["scale"].numel()) != 1:
+            raise ValueError(
+                f"LOAD-FAIL {key}: table scale must be scalar, got "
+                f"{tuple(buf['scale'].shape)}")
+        wname = key + ".weight"
+        sname = key + ".table_scale"
+        for jax_name, tensor in (
+                (wname, table),
+                (sname, buf["scale"].reshape(()).to(_torch.float32))):
+            if jax_name not in jax_set:
+                raise ValueError(
+                    f"LOAD-FAIL table target {jax_name} matches no JAX param")
+            filled.add(jax_name)
+            direct[jax_name] = tensor
+        rep["assembled"] += 1
+        _log(f"LOAD-OK {key}: table concat {tuple(table.shape)} "
+             f"({len(idxs)} shards)")
+        del buf["shards"]
     jax_set = set(jax_names)
     for ckpt_name in sorted(singles):
         jax_name = _jax_name_for(ckpt_name, jax_set)
@@ -831,23 +1025,12 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
         t = singles[ckpt_name]
         rep["unconsumed"].append(
             f"{ckpt_name} {tuple(t.shape)} {str(t.dtype)}")
-    # PLE table: zero-filled neutral ablation (host-side lookup is phase 2).
-    if table_fill == "zero" and table_seen:
-        for jax_name in sorted(set(jax_names) - filled):
-            if jax_name.endswith(".ple.embedding.weight"):
-                shape = jax_shapes.get(jax_name)
-                if shape is None:
-                    raise ValueError(
-                        f"LOAD-FAIL {jax_name}: table zero-fill needs "
-                        f"jax_shapes (pass live-model shapes)")
-                _log(f"LOAD-WARN {jax_name}: zero-filled "
-                     f"{tuple(shape)} (table on host in phase 2)")
-                rep["warnings"].append(f"{jax_name}: zero-filled table")
-                yield _emit(jax_name, _torch.zeros(shape))
     rep["filled"] = sorted(filled)
     rep["missing"] = sorted(set(jax_names) - filled)
+    rep["direct"] = {k: tuple(v.shape) for k, v in direct.items()}
     if report is not None:
         report.update(rep)
+        report["direct_tensors"] = direct
 
 
 def _concat_shards_for(target):
