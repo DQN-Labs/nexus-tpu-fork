@@ -132,7 +132,10 @@ class Qwen4ExpModel(JaxModule):
                 prefix=f"{prefix}.layers.{i}"),
         )
         # Final mixer: mix-only (no combine), emits sample stream [T, H].
-        self.mixer = GatedResidual(
+        # NOTE: attribute name IS the load contract (nnx paths derive from
+        # it): ``hyper_connection_mixer`` matches the checkpoint + loader
+        # (v58 LOAD-FAIL class: abbreviated ``mixer`` live name).
+        self.hyper_connection_mixer = GatedResidual(
             hidden_size=H, hc_count=arch.hc_count, hc_lowrank=arch.hc_lowrank,
             eps=arch.rms_norm_eps, dtype=self.dtype, rngs=rng,
             use_combine=False, prefix=prefix + ".hyper_connection_mixer")
@@ -178,12 +181,13 @@ class Qwen4ExpModel(JaxModule):
             self.layers[self.start_layer : self.end_layer]):
             gid = self.start_layer + i
             hist = histories.get(gid)
-            if hist is None and layer.indexer is not None:
+            sa = layer.self_attn
+            if hist is None and sa is not None and sa.indexer is not None:
                 hist = {"k": jnp.zeros((0, layer.arch.num_key_value_heads,
                                         layer.arch.head_dim), dtype=x.dtype),
                         "v": jnp.zeros((0, layer.arch.num_key_value_heads,
                                         layer.arch.head_dim), dtype=x.dtype),
-                        "k_raw": jnp.zeros((0, layer.indexer.head_dim),
+                        "k_raw": jnp.zeros((0, sa.indexer.head_dim),
                                            dtype=x.dtype),
                         "pos": jnp.zeros((0,), dtype=jnp.int32)}
                 histories[gid] = hist
@@ -197,10 +201,12 @@ class Qwen4ExpModel(JaxModule):
             # Materialize pending tuple for PP handoff (upstream does the
             # same before returning IntermediateTensors on non-last ranks).
             if prev_out is not None:
-                hidden = layer.mlp_hc.combine(hidden, prev_out, prev_inj)
+                hidden = layer.mlp_hyper_connection.combine(
+                    hidden, prev_out, prev_inj)
             return kv_caches, hidden, aux
-        _, sample, _ = self.mixer.combine_and_mix(hidden, prev_out, prev_inj) \
-            if prev_out is not None else self.mixer.mix(hidden)
+        _, sample, _ = self.hyper_connection_mixer.combine_and_mix(
+            hidden, prev_out, prev_inj) \
+            if prev_out is not None else self.hyper_connection_mixer.mix(hidden)
         # NOTE: MTP scheme-A multi-stream snapshot would stash ``hidden``
         # (pre-mixer [T, HC*H]) into _mtp_hidden_buffer here; the draft model
         # (Qwen4ExpMTP below) consumes it at spec_step_idx=0.

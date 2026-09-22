@@ -151,9 +151,13 @@ class Qwen4ExpMoE(JaxModule):
             jnp.zeros((e, h, max(1, i // 16)), jnp.float8_e4m3fn))
         self.exp_down_g = nnx.Param(jnp.zeros((e,), jnp.float32))
         self.n_shared_experts = int(shared_intermediate_size > 0)
+        # NOTE: attribute name IS the load contract (nnx paths derive from
+        # it): ``shared_expert`` matches the checkpoint + loader
+        # (v58 LOAD-FAIL class: abbreviated ``shared`` live name).
         if self.n_shared_experts:
-            self.shared = Qwen4ExpMLP(hidden_size, shared_intermediate_size,
-                                      rngs=rngs, prefix=prefix + ".shared_expert")
+            self.shared_expert = Qwen4ExpMLP(
+                hidden_size, shared_intermediate_size,
+                rngs=rngs, prefix=prefix + ".shared_expert")
 
     def route(
         self, x: jax.Array
@@ -202,7 +206,7 @@ class Qwen4ExpMoE(JaxModule):
         out = jax.vmap(token_moe)(xf, weights.astype(jnp.float32), idx)
         out = out.astype(x.dtype)
         if self.n_shared_experts:
-            out = out + self.shared(x)
+            out = out + self.shared_expert(x)
         return out, logits
 
 

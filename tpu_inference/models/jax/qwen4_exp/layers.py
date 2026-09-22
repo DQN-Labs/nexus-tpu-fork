@@ -111,7 +111,6 @@ class Qwen4ExpDecoderLayer(JaxModule):
                 prefix=prefix + ".linear_attn",
             )
             self.self_attn = None
-            self.indexer = None
         elif self.layer_type == "full_attention":
             self.linear_attn = None
             # Qwen4Exp forces attn_output_gate=True (see nvidia/qsa.py).
@@ -128,8 +127,15 @@ class Qwen4ExpDecoderLayer(JaxModule):
                 rngs=rngs,
                 prefix=prefix + ".self_attn",
             )
+            # NOTE: the indexer lives UNDER self_attn (not as a layer-level
+            # ``self.indexer``): the loader contract — and upstream vLLM —
+            # names it ``...self_attn.indexer.index_qk.weight``, and flax
+            # nnx derives param paths from attribute names (the ``prefix``
+            # args above are inert labels). A layer-level attribute would
+            # surface as ``...layers.N.indexer...`` and fail load loudly
+            # (diagnosed 2026-09-22: v58 LOAD-FAIL on HC names, same cause).
             if arch.use_qsa:
-                self.indexer: QSAIndexer | None = QSAIndexer(
+                self.self_attn.indexer: QSAIndexer | None = QSAIndexer(
                     hidden_size=H,
                     indexer_n_heads=int(arch.indexer_n_heads),
                     indexer_head_dim=int(arch.indexer_head_dim),
@@ -144,7 +150,7 @@ class Qwen4ExpDecoderLayer(JaxModule):
                     prefix=prefix + ".self_attn.indexer",
                 )
             else:
-                self.indexer = None
+                self.self_attn.indexer = None
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
 
@@ -172,11 +178,16 @@ class Qwen4ExpDecoderLayer(JaxModule):
             )
             self.is_moe = False
 
-        self.attn_hc = GatedResidual(
+        # NOTE: attribute names ARE the load contract — flax nnx derives
+        # ``named_parameters()`` paths from them (``prefix`` args are inert
+        # labels). These must read ``attn_hyper_connection`` /
+        # ``mlp_hyper_connection`` to match the checkpoint + loader
+        # (v58 died here with abbreviated ``attn_hc`` live names).
+        self.attn_hyper_connection = GatedResidual(
             hidden_size=H, hc_count=arch.hc_count, hc_lowrank=arch.hc_lowrank,
             eps=arch.rms_norm_eps, dtype=dtype, rngs=rngs,
             prefix=prefix + ".attn_hyper_connection")
-        self.mlp_hc = GatedResidual(
+        self.mlp_hyper_connection = GatedResidual(
             hidden_size=H, hc_count=arch.hc_count, hc_lowrank=arch.hc_lowrank,
             eps=arch.rms_norm_eps, dtype=dtype, rngs=rngs,
             prefix=prefix + ".mlp_hyper_connection")
@@ -189,7 +200,7 @@ class Qwen4ExpDecoderLayer(JaxModule):
         kv_history: Optional[dict] = None,
     ) -> jax.Array:
         assert self.self_attn is not None
-        if self.indexer is None or kv_history is None:
+        if self.self_attn.indexer is None or kv_history is None:
             _, out = self.self_attn(block_in, positions)
             return out
         # QSA path: indexer select + sparse attend over main KV history.
@@ -207,7 +218,7 @@ class Qwen4ExpDecoderLayer(JaxModule):
         v_full = jnp.concatenate([vh, v], axis=0) if vh.shape[0] else v
         kv_history["k"], kv_history["v"] = k_full, v_full
         # Indexer queries + compressed keys.
-        iq, k_raw = self.indexer.project_qk(block_in, positions)
+        iq, k_raw = self.self_attn.indexer.project_qk(block_in, positions)
         ratio = int(self.arch.indexer_compress_ratio)
         budget = int(self.arch.indexer_budget)
         # Causally-correct compression needs the *full* raw-key history, not
@@ -234,16 +245,17 @@ class Qwen4ExpDecoderLayer(JaxModule):
         if pooled.shape[0]:
             pooled_n = gemma_rmsnorm_last_dim(
                 pooled[:, None, :].astype(block_in.dtype),
-                self.indexer.k_norm_w.value,
-                self.indexer.eps,
+                self.self_attn.indexer.k_norm_w.value,
+                self.self_attn.indexer.eps,
             )[:, 0, :]
             kc, _ = apply_partial_rope(
                 pooled_n[:, None, :],
                 pooled_n[:, None, :],
                 first_pos,
-                self.indexer.head_dim,
-                min(self.indexer.main_rotary_dim, self.indexer.head_dim),
-                self.indexer.rope_theta,
+                self.self_attn.indexer.head_dim,
+                min(self.self_attn.indexer.main_rotary_dim,
+                    self.self_attn.indexer.head_dim),
+                self.self_attn.indexer.rope_theta,
             )
             kc = kc[:, 0, :]
         else:
@@ -274,17 +286,18 @@ class Qwen4ExpDecoderLayer(JaxModule):
     ) -> Tuple[jax.Array, jax.Array, Optional[jax.Array]]:
         if self.ple is not None:
             if prev_out is not None:
-                hidden = self.attn_hc.combine(hidden, prev_out, prev_inj)
+                hidden = self.attn_hyper_connection.combine(
+                    hidden, prev_out, prev_inj)
                 prev_out = prev_inj = None
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
             hidden = hidden + self.ple(hidden, input_ids, query_start_loc,
                                        ngram_context, token_to_req)
         if prev_out is not None:
-            hidden, block_in, inj = self.attn_hc.combine_and_mix(
+            hidden, block_in, inj = self.attn_hyper_connection.combine_and_mix(
                 hidden, prev_out, prev_inj)
         else:
-            hidden, block_in, inj = self.attn_hc.mix(hidden)
+            hidden, block_in, inj = self.attn_hyper_connection.mix(hidden)
 
         if self.layer_type == "linear_attention":
             assert self.linear_attn is not None
@@ -292,7 +305,8 @@ class Qwen4ExpDecoderLayer(JaxModule):
         else:
             attn_out = self._full_attn(block_in, positions, kv_history)
 
-        hidden, block_in, inj = self.mlp_hc.combine_and_mix(hidden, attn_out, inj)
+        hidden, block_in, inj = self.mlp_hyper_connection.combine_and_mix(
+            hidden, attn_out, inj)
         if self.is_moe:
             assert isinstance(self.mlp, Qwen4ExpMoE)
             mlp_out, _ = self.mlp(block_in)

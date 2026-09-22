@@ -1223,6 +1223,101 @@ def test_hf_config_neutralizes_gptq(tmp_path):
     assert not hasattr(cfg.text_config, "quantization_config")
 
 
+@requires_impl
+def test_live_param_paths_match_loader_contract(mesh):
+    """Live nnx paths must equal the loader's expected JAX names (v58).
+
+    flax nnx derives ``named_parameters()`` paths from attribute names —
+    the ``prefix=...`` labels are inert. v58 shipped abbreviated live
+    attributes (``attn_hc``, ``mlp_hc``, ``mixer``, ``shared``) plus a
+    layer-level ``indexer``, so concat targets like
+    ``...attn_hyper_connection.down_block_inject.weight`` matched no JAX
+    param and the TPU run died at layer 0 with LOAD-FAIL. This pins the
+    live paths on CPU, including the exact ``_jax_name_for`` lookups.
+    """
+    from types import SimpleNamespace
+
+    from flax import nnx
+
+    from tpu_inference.models.jax.qwen4_exp.layers import Qwen4ExpDecoderLayer
+
+    base = SimpleNamespace(
+        hidden_size=16, num_hidden_layers=2, num_attention_heads=2,
+        num_key_value_heads=2, head_dim=8, intermediate_size=32,
+        vocab_size=64, rms_norm_eps=1e-6, hidden_act="silu",
+        max_position_embeddings=64, rope_theta=10000.0,
+        partial_rotary_factor=0.5, attention_bias=False,
+        linear_conv_kernel_dim=4, linear_key_head_dim=8,
+        linear_value_head_dim=8, linear_num_key_heads=2,
+        linear_num_value_heads=2, decoder_sparse_step=1,
+        moe_intermediate_size=8, shared_expert_intermediate_size=8,
+        num_experts_per_tok=2, num_experts=4, norm_topk_prob=True,
+        mlp_only_layers=[], layer_types=None, hc_count=2, hc_lowrank=4,
+        ple_layer_ids=[2], ple_embed_dim=16, ple_conv_kernel_size=2,
+        ngram_size=3, heads_per_ngram=2, ngram_vocab_size_base=1000,
+        make_ngram_vocab_size_divisible_by=8, output_gate_type="sigmoid",
+        indexer_n_heads=2, indexer_kv_heads=1, indexer_head_dim=8,
+        indexer_budget=512, indexer_compress_ratio=1,
+    )
+    arch = cfg_mod.arch_from_hf_config(base, vocab_size=64)
+    arch.layer_types = ["full_attention", "linear_attention"]
+
+    def live_names(layer):
+        import jax
+        paths = []
+        for keypath, _leaf in jax.tree.leaves_with_path(
+                nnx.state(layer, nnx.Param)):
+            segs = [(getattr(k, "key", None) or getattr(k, "name", None))
+                    for k in keypath]
+            segs = [s for s in segs if s not in (None, "value")]
+            paths.append(".".join(segs))
+        return paths
+
+    dense = Qwen4ExpDecoderLayer(arch=arch, layer_idx=0, dtype=jnp.float32,
+                                 rngs=nnx.Rngs(0), prefix="model.layers.0")
+    names = live_names(dense)
+    for n in ("attn_hyper_connection.down_block_inject.weight",
+              "attn_hyper_connection.up.weight",
+              "attn_hyper_connection.hc_norm.weight",
+              "mlp_hyper_connection.down_block_inject.weight",
+              "mlp_hyper_connection.up.weight",
+              "self_attn.qkv.weight",
+              "self_attn.o_proj.weight",
+              "self_attn.indexer.index_qk.weight",
+              "self_attn.indexer.q_norm_w",
+              "self_attn.indexer.k_norm_w",
+              "mlp.gate.weight",
+              "mlp.exp_gate_w",
+              "mlp.shared_expert.gate_proj.weight",
+              "mlp.shared_expert.down_proj.weight"):
+        assert n in names, n
+    for n in names:
+        segs = n.split(".")
+        assert "attn_hc" not in segs, n
+        assert "mlp_hc" not in segs, n
+        assert "shared" not in segs, n
+    assert not any(n.startswith("indexer.") for n in names), names
+
+    lin = Qwen4ExpDecoderLayer(arch=arch, layer_idx=1, dtype=jnp.float32,
+                               rngs=nnx.Rngs(1), prefix="model.layers.1")
+    names_lin = live_names(lin)
+    for n in ("linear_attn.in_proj_qkvz.weight",
+              "linear_attn.in_proj_ba.weight",
+              "ple.embedding.weight",
+              "ple.embedding.table_scale",
+              "ple.kv.weight",
+              "mlp_hyper_connection.down_block_inject.weight"):
+        assert n in names_lin, n
+
+    # The exact loader lookups that raised LOAD-FAIL on v58.
+    jax_set = {"model.layers.0." + n for n in names}
+    for target in ("model.layers.0.attn_hyper_connection.down_block_inject.weight",
+                   "model.layers.0.mlp_hyper_connection.down_block_inject.weight",
+                   "model.layers.0.self_attn.indexer.index_qk.weight",
+                   "model.layers.0.mlp.shared_expert.gate_proj.weight"):
+        assert wl_mod._jax_name_for(target, jax_set) == target, target
+
+
 @pytest.mark.skipif(os.environ.get("QWEN4EXP_E2E") != "1",
                     reason="needs TPU v5e-8 + checkpoint (QWEN4EXP_E2E=1)")
 def test_e2e_tpu():
