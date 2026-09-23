@@ -177,7 +177,11 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('push')
-    p.add_argument('--last-cell', default='sweep.py')
+    # Default is the Flash-Next flow: the bare default ('sweep.py') builds
+    # the stale Qwen3-8B baseline notebook, and pushing that by accident
+    # clobbers the prod kernel (diagnosed 2026-09-23: v60 served Qwen3-8B
+    # and died on the old ACT skew instead of Flash-Next).
+    p.add_argument('--last-cell', default='fork')
     p.set_defaults(fn=cmd_push)
     p = sub.add_parser('poll')
     p.add_argument('--last-cell', default='sweep.py')
