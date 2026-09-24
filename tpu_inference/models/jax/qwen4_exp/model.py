@@ -306,10 +306,31 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
         named = dict(self.named_parameters())
         jax_names = list(named)
         mesh = getattr(self, "mesh", None)
+        try:
+            _tp = int(mesh.shape["model"]) if mesh is not None else 1
+        except Exception:  # noqa: BLE001 - metadata must not break load
+            _tp = 1
         for n, p in named.items():
             try:
-                p.set_metadata("out_sharding",
-                               sharding_spec_for(n, p.value.shape))
+                spec = sharding_spec_for(n, p.value.shape)
+                # Generic divisibility guard (v62 class): any 'model' axis
+                # whose dim does not divide evenly by TP would die later in
+                # device_put with IndivisibleError (down_block_inject's 324
+                # was the first). Downgrade such axes to replicated rather
+                # than crashing at 93% of the load.
+                if _tp > 1:
+                    fixed = tuple(
+                        None if (ax == "model" and
+                                 int(p.value.shape[i]) % _tp != 0)
+                        else ax
+                        for i, ax in enumerate(tuple(spec)))
+                    if fixed != tuple(spec):
+                        print(f"LOAD-WARN {n}: axis not divisible by "
+                              f"TP={_tp}, downgrading {tuple(spec)} -> "
+                              f"{fixed}", flush=True)
+                    from jax.sharding import PartitionSpec as _P
+                    spec = _P(*fixed)
+                p.set_metadata("out_sharding", spec)
                 if mesh is not None:
                     p.set_metadata("mesh", mesh)
             except Exception as e:  # noqa: BLE001 - report, don't break

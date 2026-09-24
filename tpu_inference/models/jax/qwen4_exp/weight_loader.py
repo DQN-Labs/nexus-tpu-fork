@@ -442,6 +442,15 @@ def sharding_spec_for(jax_name, shape):
     if jax_name.endswith((".embed_tokens.weight",
                            ".ple.embedding.weight")):
         return P("model", None)
+    if jax_name.endswith(".down_block_inject.weight"):
+        # HC merged down projection [HC*H=10240, lowrank+HC=324]: the out
+        # dim 324 is NOT divisible by TP=8, so column-sharding (the 2D
+        # default below) dies in device_put with IndivisibleError
+        # (diagnosed 2026-09-23: v62 failed at 192/206 shards). Replicate:
+        # fp32 is 13 MB/chip and replication is comm-free at use (each chip
+        # holds full rows for its T-sharded activations), unlike row
+        # sharding which would force an all-gather per HC mix.
+        return P()
     _ROW_PARALLEL = (".mlp.down_proj.weight",
                      ".mlp.shared_expert.down_proj.weight",
                      ".linear_attn.out_proj.weight")

@@ -1318,6 +1318,50 @@ def test_live_param_paths_match_loader_contract(mesh):
         assert wl_mod._jax_name_for(target, jax_set) == target, target
 
 
+@requires_impl
+def test_sharding_specs_divisible_by_tp():
+    """Every sharded axis must divide TP=8 (v62 IndivisibleError).
+
+    v62 died at 192/206 shards: the HC ``down_block_inject`` kernel
+    [10240, 324] fell into the blanket 2D ``P(None, 'model')`` rule, but
+    324 % 8 != 0. That param is now replicated (13 MB, comm-free); this
+    audits the rule table over the real-arch shape inventory so no other
+    param can hit the same wall.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    assert wl_mod.sharding_spec_for(
+        "model.layers.0.attn_hyper_connection.down_block_inject.weight",
+        (10240, 324)) == P()
+    assert wl_mod.sharding_spec_for(
+        "model.hyper_connection_mixer.down_block_inject.weight",
+        (10240, 324)) == P()
+    cases = [
+        ("model.layers.0.attn_hyper_connection.up.weight", (320, 10240)),
+        ("model.layers.0.self_attn.qkv.weight", (2560, 13312)),
+        ("model.layers.0.self_attn.o_proj.weight", (24, 256, 2560)),
+        ("model.layers.0.self_attn.indexer.index_qk.weight", (2560, 640)),
+        ("model.layers.0.linear_attn.in_proj_qkvz.weight", (2560, 16384)),
+        ("model.layers.0.linear_attn.in_proj_ba.weight", (2560, 96)),
+        ("model.layers.0.linear_attn.out_proj.weight", (6144, 2560)),
+        ("model.layers.0.mlp.gate.weight", (2560, 512)),
+        ("model.layers.0.mlp.shared_expert.down_proj.weight", (640, 2560)),
+        ("model.layers.0.mlp.exp_gate_w", (512, 640, 1280)),
+        ("model.layers.0.mlp.exp_down_sc", (512, 2560, 40)),
+        ("model.layers.0.ple.kv.weight", (2560, 12800)),
+        ("model.layers.1.ple.embedding.weight", (320001536, 160)),
+        ("model.embed_tokens.weight", (248320, 2560)),
+        ("lm_head.weight", (248320, 2560)),
+        ("model.layers.0.self_attn.q_norm_w", (256,)),
+    ]
+    for name, shape in cases:
+        spec = tuple(wl_mod.sharding_spec_for(name, shape))
+        assert len(spec) in (0, len(shape)), (name, spec)
+        for i, ax in enumerate(spec):
+            if ax == "model":
+                assert shape[i] % 8 == 0, (name, shape, spec)
+
+
 @pytest.mark.skipif(os.environ.get("QWEN4EXP_E2E") != "1",
                     reason="needs TPU v5e-8 + checkpoint (QWEN4EXP_E2E=1)")
 def test_e2e_tpu():
