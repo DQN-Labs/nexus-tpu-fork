@@ -1362,6 +1362,40 @@ def test_sharding_specs_divisible_by_tp():
                 assert shape[i] % 8 == 0, (name, shape, spec)
 
 
+@requires_impl
+def test_gdn_norm_matches_upstream_rmsnorm_gated(mesh):
+    """GDN output norm == HF ``Qwen3NextRMSNormGated(head_v_dim)``.
+
+    Per-head variance over Dv, ones-init PLAIN multiply (not Gemma
+    ``(1+w)``), norm-before-gate. v62 shipped a full-vector
+    ``(1+w)`` norm of width V*Dv and died loading (torch (128,) vs jax
+    (6144,)); the live shape is now the checkpoint shape.
+    """
+    from flax import nnx
+
+    from tpu_inference.models.jax.qwen4_exp.gdn import (
+        Qwen4ExpGDN,
+        rmsnorm_gated,
+    )
+
+    V, D = 3, 4
+    o = (jnp.arange(2 * V * D, dtype=jnp.float32).reshape(2, V * D) - 6.0) / 3.0
+    z = (jnp.arange(2 * V * D, dtype=jnp.float32).reshape(2, V * D) - 12.0) / 5.0
+    w = jnp.linspace(0.5, 1.5, D, dtype=jnp.float32)
+    y = rmsnorm_gated(o, z, w, 1e-6, gate_act="silu")
+    of = np.asarray(o, dtype=np.float32).reshape(2, V, D)
+    zf = np.asarray(z, dtype=np.float32).reshape(2, V, D)
+    ref = of / np.sqrt((of ** 2).mean(-1, keepdims=True) + 1e-6)
+    ref = ref * np.asarray(w, dtype=np.float32)[None, None, :]
+    ref = ref * (zf / (1.0 + np.exp(-zf)))
+    np.testing.assert_allclose(
+        np.asarray(y, dtype=np.float32).reshape(2, V, D), ref, rtol=1e-5)
+    mod = Qwen4ExpGDN(hidden_size=16, num_k_heads=2, num_v_heads=4,
+                      k_head_dim=8, v_head_dim=8, rngs=nnx.Rngs(0))
+    assert tuple(mod.norm_w.value.shape) == (8,)
+    assert bool((np.asarray(mod.norm_w.value) == 1.0).all())
+
+
 @pytest.mark.skipif(os.environ.get("QWEN4EXP_E2E") != "1",
                     reason="needs TPU v5e-8 + checkpoint (QWEN4EXP_E2E=1)")
 def test_e2e_tpu():

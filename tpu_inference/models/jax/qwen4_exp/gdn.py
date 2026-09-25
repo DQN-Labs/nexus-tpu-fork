@@ -56,16 +56,28 @@ def rmsnorm_gated(
     o: jax.Array, z: jax.Array, weight: jax.Array, eps: float,
     gate_act: str = "sigmoid",
 ) -> jax.Array:
-    """Upstream ``RMSNormGated``: norm(o) * act(z)."""
-    of = o.astype(jnp.float32)
+    """Upstream ``Qwen3NextRMSNormGated`` (transformers ``qwen3_next``).
+
+    - ``weight`` is ``[head_v_dim]`` **ones**-init, applied with a PLAIN
+      multiply (contrast the Gemma ``(1+w)`` zeros-init norms used for q/k).
+    - Variance is over the head dim: inputs arrive flat ``[..., V*Dv]``
+      and are viewed ``[..., V, Dv]`` so each value head is normalized
+      independently (a full-vector variance + ``[Dv]`` weight would be
+      mathematically different and the checkpoint shape proves per-head).
+    - Gate is sigmoid for Qwen4Exp ``output_gate_type`` (HF default silu
+      otherwise); norm runs before the gate.
+    """
+    dv = int(weight.shape[-1])
+    of = o.reshape(*o.shape[:-1], -1, dv).astype(jnp.float32)
+    zf = z.reshape(*z.shape[:-1], -1, dv).astype(jnp.float32)
     var = jnp.mean(jnp.square(of), axis=-1, keepdims=True)
     normed = of * jax.lax.rsqrt(var + eps)
-    normed = normed * (1.0 + weight.astype(jnp.float32))
+    normed = normed * weight.astype(jnp.float32)
     if gate_act in ("silu", "swish"):
-        g = jax.nn.silu(z.astype(jnp.float32))
+        g = jax.nn.silu(zf)
     else:  # upstream maps Qwen4Exp "sigmoid" (and default) to sigmoid
-        g = jax.nn.sigmoid(z.astype(jnp.float32))
-    return (normed * g).astype(o.dtype)
+        g = jax.nn.sigmoid(zf)
+    return (normed * g).reshape(o.shape).astype(o.dtype)
 
 
 class Qwen4ExpGDN(JaxModule):
@@ -122,8 +134,11 @@ class Qwen4ExpGDN(JaxModule):
         )
         self.A_log = nnx.Param(jnp.zeros((num_v_heads,), dtype=jnp.float32))
         self.dt_bias = nnx.Param(jnp.zeros((num_v_heads,), dtype=jnp.float32))
+        # Output norm: upstream Qwen3NextRMSNormGated(head_v_dim), ones-init.
+        # Per-head dim (NOT num_v_heads*v_head_dim): the checkpoint ships
+        # [v_head_dim] (v62: torch (128,) vs jax (6144,) LOAD-FAIL).
         self.norm_w = nnx.Param(
-            jnp.zeros((num_v_heads * v_head_dim,), dtype=jnp.float32)
+            jnp.ones((v_head_dim,), dtype=jnp.float32)
         )
         self.out_proj = JaxEinsum(
             "TD,DK->TK",
