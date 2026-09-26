@@ -442,8 +442,12 @@ class Qwen4ExpPLE(JaxModule):
         self.norm_key_w = nnx.Param(jnp.zeros((wide,), dtype=jnp.float32))
         self.norm_query_w = nnx.Param(jnp.zeros((wide,), dtype=jnp.float32))
         self.norm_conv_w = nnx.Param(jnp.zeros((wide,), dtype=jnp.float32))
-        # Dilated depthwise conv weight, zero-init (upstream _no_reinit).
-        self.conv_w = nnx.Param(jnp.zeros((wide, conv_kernel), dtype=jnp.float32))
+        # Depthwise conv weight, zero-init (upstream _no_reinit). Keeps the
+        # checkpoint's 3D layout [C, 1, K] (torch conv1d) so the loader
+        # assigns 1:1 (v66: torch (10240,1,4) vs 2D jax (10240,4)
+        # LOAD-FAIL); squeezed at use like the GDN conv weight.
+        self.conv_w = nnx.Param(
+            jnp.zeros((wide, 1, conv_kernel), dtype=jnp.float32))
 
     def gate(
         self, hidden: jax.Array, kv: jax.Array
@@ -476,10 +480,11 @@ class Qwen4ExpPLE(JaxModule):
         self, conv_in: jax.Array, conv_state: Optional[jax.Array] = None
     ) -> jax.Array:
         # Depthwise dilated conv1d, dilation=ngram_size, causal.
-        # conv_in: [T, C]; weight [C, K] zero-init at start of training.
+        # conv_in: [T, C]; weight [C, 1, K] (checkpoint layout) zero-init
+        # at start of training.
         # Gather-based (no per-token Python loop): the loop unrolls T times
         # under jit and explodes compile time on long prefills.
-        w = self.conv_w.value.astype(jnp.float32)  # [C, K]
+        w = self.conv_w.value[:, 0, :].astype(jnp.float32)  # [C, K]
         k, dil = self.conv_kernel, self.ngram_size
         hist_len = (k - 1) * dil
         if conv_state is not None:

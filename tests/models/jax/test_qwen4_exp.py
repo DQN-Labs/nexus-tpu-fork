@@ -556,7 +556,10 @@ def test_dilated_conv_gather_matches_loop_and_jits():
     x = jnp.asarray(np.random.default_rng(2).normal(size=(9, 16)),
                     dtype=jnp.float32)
     got = ple.dilated_conv(x)
-    w = np.asarray(ple.conv_w.value, dtype=np.float32)
+    # Checkpoint layout [C, 1, K] (v66 LOAD-FAIL class: a squeezed 2D param
+    # mismatches the torch conv1d weight).
+    assert tuple(ple.conv_w.value.shape) == (16, 1, 2)
+    w = np.asarray(ple.conv_w.value[:, 0, :], dtype=np.float32)
     xn = np.asarray(x, dtype=np.float32)
     zero = np.zeros((16,), dtype=np.float32)
     ref = np.stack([
