@@ -1399,6 +1399,40 @@ def test_gdn_norm_matches_upstream_rmsnorm_gated(mesh):
     assert bool((np.asarray(mod.norm_w.value) == 1.0).all())
 
 
+@requires_impl
+def test_torch_to_jax_host_roundtrip():
+    """Host-side torch->JAX conversion is bit-exact without XLA (v68).
+
+    v68 died converting the 51 GB fp8 table via ``t2j`` (95 GB then
+    381 GB HLO temporaries -> RESOURCE_EXHAUSTED). Direct tensors now
+    cross on the host; fp8 has no numpy dtype so it travels as uint8
+    bits and is viewed back.
+    """
+    torch = pytest.importorskip("torch")
+    import jax.numpy as jnp
+
+    from tpu_inference.models.jax.qwen4_exp.weight_loader import (
+        torch_to_jax_host,
+    )
+
+    rng = torch.Generator().manual_seed(0)
+    w8 = (torch.randint(0, 256, (65, 130), generator=rng,
+                       dtype=torch.uint8).t() + 0).contiguous().t()
+    assert not w8.is_contiguous()
+    j8 = torch_to_jax_host(w8)
+    assert tuple(j8.shape) == (65, 130) and str(j8.dtype) == "uint8"
+    np.testing.assert_array_equal(np.asarray(j8), w8.contiguous().numpy())
+    f8 = torch.randint(0, 256, (17, 40), generator=rng,
+                       dtype=torch.uint8).view(torch.float8_e4m3fn)
+    jf = torch_to_jax_host(f8)
+    assert str(jf.dtype) == "float8_e4m3fn"
+    np.testing.assert_array_equal(
+        np.asarray(jf.view(jnp.uint8)), np.asarray(f8.view(torch.uint8)))
+    f4 = torch.randn(9, 33, generator=rng)
+    j4 = torch_to_jax_host(f4)
+    np.testing.assert_array_equal(np.asarray(j4), f4.numpy())
+
+
 @pytest.mark.skipif(os.environ.get("QWEN4EXP_E2E") != "1",
                     reason="needs TPU v5e-8 + checkpoint (QWEN4EXP_E2E=1)")
 def test_e2e_tpu():

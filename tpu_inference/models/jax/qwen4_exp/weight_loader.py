@@ -1042,6 +1042,37 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
         report["direct_tensors"] = direct
 
 
+def torch_to_jax_host(tensor):
+    """CPU torch tensor -> host JAX array WITHOUT touching HBM.
+
+    The stock ``t2j`` converts via XLA (bit-cast, then a torchax fallback),
+    which stages HLO temporaries proportional to the FULL tensor on device:
+    the 51 GB fp8 PLE table needed 95 GB temporaries on the bit-cast path
+    and 381 GB on the fallback (diagnosed 2026-09-27: v68 RESOURCE_EXHAUSTED
+    with 15.75 GB/chip free for the actual shards). Host-side conversion is
+    pure memcpy; the subsequent ``device_put`` under the param's sharding
+    spec streams per-chip shards (6.4 GB/chip for the table).
+
+    fp8 has no numpy dtype, so it crosses as uint8 bits and is viewed back
+    (bit-exact); everything else goes through ``numpy()`` (a view, no copy)
+    into a host JAX buffer.
+    """
+    import jax.numpy as jnp
+    import torch
+
+    t = tensor.detach().to("cpu")
+    if not t.is_contiguous():
+        t = t.contiguous()
+    if t.dtype == torch.float8_e4m3fn:
+        raw = t.view(torch.uint8).numpy()
+        try:
+            return jnp.asarray(raw).view(jnp.float8_e4m3fn)
+        except Exception:  # noqa: BLE001 - older jax without fp8 view
+            return jnp.frombuffer(raw, dtype=jnp.float8_e4m3fn).reshape(
+                tuple(t.shape))
+    return jnp.asarray(t.numpy())
+
+
 def _concat_shards_for(target):
     for jax_suffix, (shards, _axis) in _CONCAT_GROUPS.items():
         if target.endswith("." + jax_suffix):
@@ -1104,4 +1135,5 @@ __all__ = [
     "remap_qsa_scale_name",
     "stacked_target",
     "strip_mtp_prefix",
+    "torch_to_jax_host",
 ]

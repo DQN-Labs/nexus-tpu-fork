@@ -295,12 +295,12 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
         from .weight_loader import (
             iter_jax_named_weights,
             sharding_spec_for,
+            torch_to_jax_host,
         )
         from tpu_inference.models.jax.utils.weight_utils import (
             JaxAutoWeightsLoader,
             assign_and_shard_param,
         )
-        from tpu_inference.utils import t2j
 
         arch = self.model.arch
         named = dict(self.named_parameters())
@@ -348,22 +348,33 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
         )
         loaded = loader.load_weights(gen)
         # Exact direct assignment (quantized triplets, fp8 table).
+        # Host-side conversion (torch_to_jax_host), NOT t2j: t2j converts
+        # via XLA and stages full-tensor HLO temporaries on device (v68:
+        # 95 GB then 381 GB temporaries for the 51 GB table ->
+        # RESOURCE_EXHAUSTED). Host arrays device_put per-shard instead.
+        # Host tensors are freed as we go (table + triplets ~80 GB host).
         direct = report.get("direct_tensors", {}) or {}
-        for name, tensor in direct.items():
+        direct_names = sorted(direct)
+        for name in direct_names:
+            tensor = direct.pop(name)
             param = named.get(name)
             if param is None:
                 raise RuntimeError(
                     f"LOAD-FAIL direct target {name} matches no JAX param")
-            assign_and_shard_param(param, t2j(tensor), name)
-        filled = set(report.get("filled", [])) | set(direct)
-        missing = [m for m in report.get("missing", []) if m not in direct]
+            assign_and_shard_param(param, torch_to_jax_host(tensor), name)
+            del tensor
+        import gc as _gc
+        _gc.collect()
+        filled = set(report.get("filled", [])) | set(direct_names)
+        missing = [m for m in report.get("missing", [])
+                   if m not in direct_names]
         unconsumed = report.get("unconsumed", [])
         summary = {
             "jax_params": len(jax_names),
             "filled": len(filled),
             "autoloader_loaded": sorted(loaded),
-            "direct": sorted(direct),
-            "direct_count": len(direct),
+            "direct": direct_names,
+            "direct_count": len(direct_names),
             "missing": missing,
             "missing_count": len(missing),
             "unconsumed_count": len(unconsumed),
@@ -374,7 +385,7 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
             "warnings": report.get("warnings", []),
         }
         print(f"LOAD-REPORT filled={len(filled)}/{len(jax_names)} "
-              f"direct={len(direct)} dequant={summary['dequantized']} "
+              f"direct={len(direct_names)} dequant={summary['dequantized']} "
               f"assembled={summary['assembled']} "
               f"missing={len(missing)} unconsumed={len(unconsumed)}",
               flush=True)
