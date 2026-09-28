@@ -1433,6 +1433,33 @@ def test_torch_to_jax_host_roundtrip():
     np.testing.assert_array_equal(np.asarray(j4), f4.numpy())
 
 
+@requires_impl
+def test_direct_shard_ranges():
+    """Row-chunk arithmetic for per-shard direct placement (v70).
+
+    v70 proved even ``jnp.asarray`` stages a 51 GB table on HBM inside
+    the TPU worker, so large direct tensors are sliced on the host and
+    placed per-chip. This pins the pure slicing logic.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    from tpu_inference.models.jax.qwen4_exp.model import (
+        _direct_shard_ranges,
+    )
+
+    r = _direct_shard_ranges((320001536, 160), P("model", None), 8)
+    assert r is not None and len(r) == 8
+    assert r[0] == (0, 40000192) and r[-1] == (280001344, 320001536)
+    assert sum(hi - lo for lo, hi in r) == 320001536
+    r = _direct_shard_ranges((512, 640, 1280), P("model", None, None), 8)
+    assert [hi - lo for lo, hi in r] == [64] * 8
+    # Replicated / scalar / indivisible -> caller falls back, never crash.
+    assert _direct_shard_ranges((10240, 324), P(), 8) is None
+    assert _direct_shard_ranges((), P(), 8) is None
+    assert _direct_shard_ranges((10240, 324), P(None, "model"), 8) is None
+    assert _direct_shard_ranges((100, 10), P("model", None), 8) is None
+
+
 @pytest.mark.skipif(os.environ.get("QWEN4EXP_E2E") != "1",
                     reason="needs TPU v5e-8 + checkpoint (QWEN4EXP_E2E=1)")
 def test_e2e_tpu():

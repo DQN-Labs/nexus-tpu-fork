@@ -89,6 +89,80 @@ from .layers import Qwen4ExpDecoderLayer
 
 _init = nnx.initializers.uniform()
 
+#: Tensors at or above this size never form a whole JAX array on device:
+#: they are sliced on the host and placed per-shard (v70: even
+#: ``jnp.asarray`` of the 51 GB table staged 95 GB of HBM temporaries).
+_DIRECT_SHARD_THRESHOLD = 256 << 20
+
+
+def _direct_shard_ranges(shape, spec, tp_size):
+    """Row ranges splitting the first ``model``-sharded axis over TP.
+
+    Pure helper (CPU-testable): returns ``[(start, end)] * tp_size`` along
+    the sharded axis, or ``None`` when the spec shards nothing (replicated
+    / scalar) or the axis does not divide evenly (caller falls back).
+    """
+    dims = tuple(int(d) for d in shape)
+    axes = tuple(spec)
+    for i, ax in enumerate(axes):
+        if ax == "model":
+            if dims[i] % tp_size != 0:
+                return None
+            n = dims[i] // tp_size
+            return [(s * n, (s + 1) * n) for s in range(tp_size)]
+    return None
+
+
+def _assign_direct(param, tensor, name, mesh, spec):
+    """Assign one direct (quantized-residency) tensor without HBM staging.
+
+    Small tensors convert whole on the host (bounded by
+    ``_DIRECT_SHARD_THRESHOLD``); large ones are sliced on the host into
+    TP row-chunks, each ``device_put`` straight to its chip, and stitched
+    with ``make_array_from_single_device_arrays``. At no point does a
+    full-size array exist on device, so placement cannot OOM the way
+    ``t2j``/``jnp.asarray`` did (v68/v70: 95-381 GB temporaries).
+    """
+    import jax
+    import jax.numpy as jnp
+    import torch
+    from jax.sharding import NamedSharding
+    from tpu_inference.models.jax.utils.weight_utils import (
+        assign_and_shard_param,
+    )
+    from .weight_loader import torch_to_jax_host
+
+    t = tensor.detach().to("cpu")
+    if not t.is_contiguous():
+        t = t.contiguous()
+    is_fp8 = t.dtype == torch.float8_e4m3fn
+    raw = (t.view(torch.uint8).numpy() if is_fp8 else t.numpy())
+    shape = tuple(int(d) for d in t.shape)
+    tp = int(mesh.shape["model"]) if mesh is not None else 1
+    ranges = (_direct_shard_ranges(shape, tuple(spec), tp)
+              if mesh is not None and tp > 1 else None)
+    if ranges is None or raw.nbytes < _DIRECT_SHARD_THRESHOLD:
+        assign_and_shard_param(param, torch_to_jax_host(t), name)
+        return
+    axis = next(i for i, ax in enumerate(tuple(spec)) if ax == "model")
+    devs = list(mesh.devices.flat)
+    assert len(devs) >= tp, (len(devs), tp)
+    pieces = []
+    try:
+        for s, (lo, hi) in enumerate(ranges):
+            sel = [slice(None)] * len(shape)
+            sel[axis] = slice(lo, hi)
+            placed = jax.device_put(raw[tuple(sel)], devs[s])
+            if is_fp8:
+                placed = placed.view(jnp.float8_e4m3fn)
+            pieces.append(placed)
+        arr = jax.make_array_from_single_device_arrays(
+            shape, NamedSharding(mesh, spec), pieces)
+        assign_and_shard_param(param, arr, name)
+    finally:
+        del pieces
+        del raw
+
 
 def _hf_config_of(vllm_config) -> object:
     mc = vllm_config.model_config
@@ -295,11 +369,9 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
         from .weight_loader import (
             iter_jax_named_weights,
             sharding_spec_for,
-            torch_to_jax_host,
         )
         from tpu_inference.models.jax.utils.weight_utils import (
             JaxAutoWeightsLoader,
-            assign_and_shard_param,
         )
 
         arch = self.model.arch
@@ -310,6 +382,7 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
             _tp = int(mesh.shape["model"]) if mesh is not None else 1
         except Exception:  # noqa: BLE001 - metadata must not break load
             _tp = 1
+        specs: dict = {}
         for n, p in named.items():
             try:
                 spec = sharding_spec_for(n, p.value.shape)
@@ -331,6 +404,7 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
                     from jax.sharding import PartitionSpec as _P
                     spec = _P(*fixed)
                 p.set_metadata("out_sharding", spec)
+                specs[n] = spec
                 if mesh is not None:
                     p.set_metadata("mesh", mesh)
             except Exception as e:  # noqa: BLE001 - report, don't break
@@ -347,12 +421,9 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
                            if not hasattr(self, "lm_head") else None),
         )
         loaded = loader.load_weights(gen)
-        # Exact direct assignment (quantized triplets, fp8 table).
-        # Host-side conversion (torch_to_jax_host), NOT t2j: t2j converts
-        # via XLA and stages full-tensor HLO temporaries on device (v68:
-        # 95 GB then 381 GB temporaries for the 51 GB table ->
-        # RESOURCE_EXHAUSTED). Host arrays device_put per-shard instead.
-        # Host tensors are freed as we go (table + triplets ~80 GB host).
+        # Exact direct assignment (quantized triplets, fp8 table) with
+        # per-shard host->device placement (never stages a full array on
+        # HBM). Host tensors are freed as we go (table + triplets ~80 GB).
         direct = report.get("direct_tensors", {}) or {}
         direct_names = sorted(direct)
         for name in direct_names:
@@ -361,7 +432,8 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
             if param is None:
                 raise RuntimeError(
                     f"LOAD-FAIL direct target {name} matches no JAX param")
-            assign_and_shard_param(param, torch_to_jax_host(tensor), name)
+            _assign_direct(param, tensor, name, mesh,
+                           specs.get(name, ()))
             del tensor
         import gc as _gc
         _gc.collect()
