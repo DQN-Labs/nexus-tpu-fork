@@ -89,39 +89,25 @@ from .layers import Qwen4ExpDecoderLayer
 
 _init = nnx.initializers.uniform()
 
-#: Tensors at or above this size never form a whole JAX array on device:
-#: they are sliced on the host and placed per-shard (v70: even
-#: ``jnp.asarray`` of the 51 GB table staged 95 GB of HBM temporaries).
+#: Tensors at or above this size are placed via sharded ``device_put``
+#: straight from the host numpy buffer (v70: even ``jnp.asarray`` of the
+#: 51 GB table staged 95 GB of HBM temporaries inside the TPU worker).
 _DIRECT_SHARD_THRESHOLD = 256 << 20
-
-
-def _direct_shard_ranges(shape, spec, tp_size):
-    """Row ranges splitting the first ``model``-sharded axis over TP.
-
-    Pure helper (CPU-testable): returns ``[(start, end)] * tp_size`` along
-    the sharded axis, or ``None`` when the spec shards nothing (replicated
-    / scalar) or the axis does not divide evenly (caller falls back).
-    """
-    dims = tuple(int(d) for d in shape)
-    axes = tuple(spec)
-    for i, ax in enumerate(axes):
-        if ax == "model":
-            if dims[i] % tp_size != 0:
-                return None
-            n = dims[i] // tp_size
-            return [(s * n, (s + 1) * n) for s in range(tp_size)]
-    return None
 
 
 def _assign_direct(param, tensor, name, mesh, spec):
     """Assign one direct (quantized-residency) tensor without HBM staging.
 
     Small tensors convert whole on the host (bounded by
-    ``_DIRECT_SHARD_THRESHOLD``); large ones are sliced on the host into
-    TP row-chunks, each ``device_put`` straight to its chip, and stitched
-    with ``make_array_from_single_device_arrays``. At no point does a
-    full-size array exist on device, so placement cannot OOM the way
-    ``t2j``/``jnp.asarray`` did (v68/v70: 95-381 GB temporaries).
+    ``_DIRECT_SHARD_THRESHOLD``). Large ones go host numpy ->
+    ``jax.device_put`` under the param's sharding, which slices host-side
+    during transfer in the sharding's own device order (never a whole
+    array on device, and no hand-ordered shards that could silently
+    misplace rows -- the mesh order is topology order, e.g.
+    [0,1,2,3,7,6,5,4], not sorted). fp8 has no numpy dtype so it crosses
+    as uint8 bits with one metadata-only ``view`` on the already
+    mesh-conformant array (a ``view`` on single-device buffers dies under
+    the ambient mesh context -- diagnosed 2026-09-29, v72).
     """
     import jax
     import jax.numpy as jnp
@@ -135,32 +121,19 @@ def _assign_direct(param, tensor, name, mesh, spec):
     t = tensor.detach().to("cpu")
     if not t.is_contiguous():
         t = t.contiguous()
-    is_fp8 = t.dtype == torch.float8_e4m3fn
-    raw = (t.view(torch.uint8).numpy() if is_fp8 else t.numpy())
-    shape = tuple(int(d) for d in t.shape)
-    tp = int(mesh.shape["model"]) if mesh is not None else 1
-    ranges = (_direct_shard_ranges(shape, tuple(spec), tp)
-              if mesh is not None and tp > 1 else None)
-    if ranges is None or raw.nbytes < _DIRECT_SHARD_THRESHOLD:
+    sharding = NamedSharding(mesh, spec) if mesh is not None else None
+    if sharding is None or t.numel() * t.element_size() < _DIRECT_SHARD_THRESHOLD:
         assign_and_shard_param(param, torch_to_jax_host(t), name)
         return
-    axis = next(i for i, ax in enumerate(tuple(spec)) if ax == "model")
-    devs = list(mesh.devices.flat)
-    assert len(devs) >= tp, (len(devs), tp)
-    pieces = []
+    is_fp8 = t.dtype == torch.float8_e4m3fn
+    raw = (t.view(torch.uint8).numpy() if is_fp8 else t.numpy())
+    placed = jax.device_put(raw, sharding)
+    if is_fp8:
+        placed = placed.view(jnp.float8_e4m3fn)
     try:
-        for s, (lo, hi) in enumerate(ranges):
-            sel = [slice(None)] * len(shape)
-            sel[axis] = slice(lo, hi)
-            placed = jax.device_put(raw[tuple(sel)], devs[s])
-            if is_fp8:
-                placed = placed.view(jnp.float8_e4m3fn)
-            pieces.append(placed)
-        arr = jax.make_array_from_single_device_arrays(
-            shape, NamedSharding(mesh, spec), pieces)
-        assign_and_shard_param(param, arr, name)
+        assign_and_shard_param(param, placed, name)
     finally:
-        del pieces
+        del placed
         del raw
 
 

@@ -1434,30 +1434,29 @@ def test_torch_to_jax_host_roundtrip():
 
 
 @requires_impl
-def test_direct_shard_ranges():
-    """Row-chunk arithmetic for per-shard direct placement (v70).
+def test_direct_placement_ops(mesh):
+    """Place-then-view: the exact v72 direct-placement op pattern.
 
-    v70 proved even ``jnp.asarray`` stages a 51 GB table on HBM inside
-    the TPU worker, so large direct tensors are sliced on the host and
-    placed per-chip. This pins the pure slicing logic.
+    v72 died on ``.view(fp8)`` of single-device buffers under the ambient
+    mesh context; the view now runs on the mesh-conformant placed array
+    (``jax.device_put`` shards host-side in the sharding's own order, so
+    no hand-ordered shards either). Exercised here on CPU for op
+    compatibility + bit-exactness.
     """
+    import jax
+    import jax.numpy as jnp
+
+    from jax.sharding import NamedSharding
     from jax.sharding import PartitionSpec as P
 
-    from tpu_inference.models.jax.qwen4_exp.model import (
-        _direct_shard_ranges,
-    )
-
-    r = _direct_shard_ranges((320001536, 160), P("model", None), 8)
-    assert r is not None and len(r) == 8
-    assert r[0] == (0, 40000192) and r[-1] == (280001344, 320001536)
-    assert sum(hi - lo for lo, hi in r) == 320001536
-    r = _direct_shard_ranges((512, 640, 1280), P("model", None, None), 8)
-    assert [hi - lo for lo, hi in r] == [64] * 8
-    # Replicated / scalar / indivisible -> caller falls back, never crash.
-    assert _direct_shard_ranges((10240, 324), P(), 8) is None
-    assert _direct_shard_ranges((), P(), 8) is None
-    assert _direct_shard_ranges((10240, 324), P(None, "model"), 8) is None
-    assert _direct_shard_ranges((100, 10), P("model", None), 8) is None
+    raw = np.arange(64, dtype=np.uint8).reshape(8, 8)
+    placed = jax.device_put(raw, NamedSharding(mesh, P()))
+    viewed = placed.view(jnp.float8_e4m3fn)
+    assert str(viewed.dtype) == "float8_e4m3fn"
+    np.testing.assert_array_equal(np.asarray(viewed.view(jnp.uint8)), raw)
+    rowed = jax.device_put(raw, NamedSharding(mesh, P("model", None)))
+    assert tuple(rowed.shape) == (8, 8)
+    np.testing.assert_array_equal(np.asarray(rowed), raw)
 
 
 @pytest.mark.skipif(os.environ.get("QWEN4EXP_E2E") != "1",
