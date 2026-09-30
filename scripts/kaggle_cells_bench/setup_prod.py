@@ -48,10 +48,25 @@ MODULE_DEPS = ["fastapi", "uvicorn", "openai", "pydantic", "tiktoken",
 
 PY = sys.executable
 
-def stage(name, cmd, timeout_s=1500):
+def stage(name, cmd, timeout_s=1500, attempts=2):
+    # Slow-mirror flakes are real (diagnosed 2026-09-30: the
+    # tpu_inference stage timed out at 1500s mid torch-uninstall on a
+    # fresh image pulling the full CUDA torch wheel). Retry once with a
+    # longer fuse instead of failing the whole notebook.
     t0 = time.time()
     print(f"[{time.strftime('%H:%M:%S')}] START {name}", flush=True)
-    subprocess.check_call(cmd, timeout=timeout_s)
+    last = None
+    for a in range(attempts):
+        try:
+            subprocess.check_call(cmd, timeout=timeout_s * (a + 1))
+            last = None
+            break
+        except Exception as e:  # noqa: BLE001 - retry, then raise
+            last = e
+            print(f"[{time.strftime('%H:%M:%S')}] {name} attempt {a + 1} "
+                  f"failed ({type(e).__name__}), retrying...", flush=True)
+    if last is not None:
+        raise last
     dt = time.time() - t0
     (W / f"stage_{name}.txt").write_text(f"ok in {dt:.0f}s")
     print(f"[{time.strftime('%H:%M:%S')}] DONE {name} in {dt:.0f}s", flush=True)
@@ -83,9 +98,12 @@ if problems:
         print("  -", p, flush=True)
     # transformers pin lives on the base line (must satisfy --no-deps vllm
     # and prior tpu-inference installs); runtime deps + torchaudio follow.
+    # The tpu_inference stage carries the giant torch wheel download, so it
+    # gets the longest fuse.
     stage("tpu_inference", [PY, "-m", "pip", "install",
                             "tpu-inference==0.28.0", "transformers>=5.5.3",
-                            "huggingface_hub>=1.27.0", "requests"])
+                            "huggingface_hub>=1.27.0", "requests"],
+          timeout_s=3600)
     stage("vllm_nodeps", [PY, "-m", "pip", "install", "--no-deps",
                           "vllm==0.28.0"])
     stage("vllm_runtime_deps", [PY, "-m", "pip", "install",
