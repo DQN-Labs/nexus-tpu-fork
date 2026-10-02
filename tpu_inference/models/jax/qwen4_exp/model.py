@@ -128,7 +128,11 @@ def _assign_direct(param, tensor, name, mesh, spec):
     is_fp8 = t.dtype == torch.float8_e4m3fn
     raw = (t.view(torch.uint8).numpy() if is_fp8 else t.numpy())
     placed = jax.device_put(raw, sharding)
-    if is_fp8:
+    if is_fp8 and param.value.dtype == jnp.float8_e4m3fn:
+        # Small fp8 params only (e.g. MoE scales, ~26 MB): the view
+        # materializes a copy, which is fine at this size. The 51 GB PLE
+        # table param is uint8 (viewed per lookup in forward), so a table
+        # bitcast here would OOM (v74) -- assign the bits directly.
         placed = placed.view(jnp.float8_e4m3fn)
     try:
         assign_and_shard_param(param, placed, name)

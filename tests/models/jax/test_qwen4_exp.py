@@ -1459,6 +1459,35 @@ def test_direct_placement_ops(mesh):
     np.testing.assert_array_equal(np.asarray(rowed), raw)
 
 
+@requires_impl
+def test_ple_fp8_table_uint8_lookup(mesh):
+    """PLE table stores uint8 bits; lookup views gathered rows as fp8.
+
+    A device-side view of the whole 51 GB table materializes a second
+    copy and OOMs at load (v74), so only gathered rows are ever viewed.
+    Known e4m3 codes (torch/JAX agree): 0x40=2.0, 0xC0=-2.0, 0x00=0.0,
+    0x38=1.0.
+    """
+    import jax.numpy as jnp
+    from flax import nnx
+
+    from tpu_inference.models.jax.qwen4_exp.ngram import PLEFp8Table
+
+    tab = PLEFp8Table(num_embeddings=4, features=4, rngs=nnx.Rngs(0))
+    assert str(tab.weight.value.dtype) == "uint8"
+    tab.weight.value = jnp.asarray(
+        [[0x40, 0xC0, 0x00, 0x38],
+         [0x00, 0x00, 0x00, 0x00],
+         [0x38, 0x38, 0x38, 0x38],
+         [0xC0, 0x40, 0x38, 0x00]], dtype=jnp.uint8)
+    tab.table_scale.value = jnp.asarray(2.0, dtype=jnp.float32)
+    got = tab(jnp.asarray([0, 2], dtype=jnp.int32))
+    np.testing.assert_allclose(
+        np.asarray(got, dtype=np.float32),
+        [[4.0, -4.0, 0.0, 2.0],
+         [2.0, 2.0, 2.0, 2.0]], rtol=1e-5)
+
+
 @pytest.mark.skipif(os.environ.get("QWEN4EXP_E2E") != "1",
                     reason="needs TPU v5e-8 + checkpoint (QWEN4EXP_E2E=1)")
 def test_e2e_tpu():

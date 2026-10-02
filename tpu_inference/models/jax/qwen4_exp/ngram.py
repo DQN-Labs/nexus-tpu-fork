@@ -62,10 +62,17 @@ from ._jax_compat import JaxEinsum, JaxEmbed
 class PLEFp8Table(JaxModule):
     """FP8 n-gram embedding table with dequant-on-lookup.
 
-    Params: ``weight`` fp8-e4m3 ``[rows, head_dim]`` + ``table_scale``
-    fp32 scalar (the export's single global ``weight_scale``). Forward
-    gathers rows, widens to fp32 exactly, and scales. Rows shard over the
-    ``model`` TP axis like a vocabulary embedding.
+    Params: ``weight`` uint8 ``[rows, head_dim]`` holding fp8-e4m3 BITS +
+    ``table_scale`` fp32 scalar (the export's single global
+    ``weight_scale``). Forward gathers rows, views the gathered bits as
+    fp8 (KBs, never the whole table), widens to fp32 exactly, and scales.
+    Rows shard over the ``model`` TP axis like a vocabulary embedding.
+
+    The weight is uint8 rather than fp8 ON PURPOSE: a device-side
+    ``view`` of the full 51 GB table materializes a second 6.4 GB/chip
+    copy and OOMs v5e-8 at load (diagnosed 2026-10-02, v74: 5.96 GB
+    alloc against 4.16 GB free). Per-lookup views of gathered rows are
+    trivially small.
     """
 
     def __init__(self, num_embeddings: int, features: int, rngs=None,
@@ -76,11 +83,11 @@ class PLEFp8Table(JaxModule):
         rngs = rngs or nnx.Rngs(0)
         del rngs  # values come from the checkpoint, never random
         self.weight = nnx.Param(
-            jnp.zeros((num_embeddings, features), dtype=jnp.float8_e4m3fn))
+            jnp.zeros((num_embeddings, features), dtype=jnp.uint8))
         self.table_scale = nnx.Param(jnp.zeros((), dtype=jnp.float32))
 
     def __call__(self, ids: jax.Array) -> jax.Array:
-        rows = self.weight.value[ids]
+        rows = self.weight.value[ids].view(jnp.float8_e4m3fn)
         return rows.astype(jnp.float32) * self.table_scale.value
 
 _init = nnx.initializers.uniform()
