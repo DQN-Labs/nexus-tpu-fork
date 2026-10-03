@@ -43,7 +43,7 @@ Gate (``ple_gate``):
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -58,37 +58,74 @@ except ImportError:  # pragma: no cover
 
 from ._jax_compat import JaxEinsum, JaxEmbed
 
+try:
+    # Host gather primitive: io_callback on older JAX, pure_callback once
+    # io_callback was removed (the gather is genuinely pure: read-only
+    # host table, same ids -> same rows).
+    from jax.experimental.io_callback import io_callback as _host_callback
+except ImportError:  # pragma: no cover - new JAX
+    from jax import pure_callback as _host_callback
 
-class PLEFp8Table(JaxModule):
-    """FP8 n-gram embedding table with dequant-on-lookup.
 
-    Params: ``weight`` uint8 ``[rows, head_dim]`` holding fp8-e4m3 BITS +
-    ``table_scale`` fp32 scalar (the export's single global
-    ``weight_scale``). Forward gathers rows, views the gathered bits as
-    fp8 (KBs, never the whole table), widens to fp32 exactly, and scales.
-    Rows shard over the ``model`` TP axis like a vocabulary embedding.
+# Host-resident PLE n-gram tables (upstream ``VLLM_PLE_CPU_OFFLOAD``
+# design: ``Qwen4ExpPLEPinnedHostEmbedding`` keeps the table in pinned
+# host RAM and only looked-up rows cross to the device; SGLang's
+# ``ple-offload-embedding`` is the same idea). The 320M-row table lives
+# here in HOST RAM as bf16 (~102 GB, dequantized once at load from the
+# fp8 export) instead of HBM: each token touches only KBs of rows, so
+# full HBM residency wastes ~6.4 GB/chip for a near-cold working set,
+# and it is what blocks long-context KV headroom.
+#
+# Keyed by JAX embedding path (``model.layers.{i}.ple.embedding``);
+# filled by weight_loader at load. NEVER a JAX param, NEVER on device:
+# keep it out of module attributes (a 102 GB pytree leaf would be
+# traced as a constant); modules reference it by key string only.
+PLE_HOST_TABLES: Dict[str, object] = {}
 
-    The weight is uint8 rather than fp8 ON PURPOSE: a device-side
-    ``view`` of the full 51 GB table materializes a second 6.4 GB/chip
-    copy and OOMs v5e-8 at load (diagnosed 2026-10-02, v74: 5.96 GB
-    alloc against 4.16 GB free). Per-lookup views of gathered rows are
-    trivially small.
+
+class PLEHostTable(JaxModule):
+    """Host-RAM n-gram embedding table with gather-on-host lookup.
+
+    Upstream reference: vLLM ``VLLM_PLE_CPU_OFFLOAD=1``
+    (``Qwen4ExpPLEPinnedHostEmbedding``) — the table lives in host RAM
+    and only looked-up rows cross to the device (async-prefetched there;
+    here transferred inline, KBs per step).
+
+    Device params: NONE. The bf16 host table lives in ``PLE_HOST_TABLES``
+    under ``host_key`` (filled by weight_loader; dequantized once at load
+    from the fp8 export + global scale). ``__call__`` takes flat int ids
+    ``[n]`` (ID hashing stays on device, already trace-safe) and returns
+    bf16 rows ``[n, features]`` on device via a host callback. The table
+    must never become a module attribute: a 102 GB pytree leaf would be
+    traced as a constant.
     """
 
     def __init__(self, num_embeddings: int, features: int, rngs=None,
-                 prefix: str = "") -> None:
+                 prefix: str = "", host_key: str = "") -> None:
         self.num_embeddings = num_embeddings
         self.features = features
         self.prefix = prefix
+        self.host_key = host_key
         rngs = rngs or nnx.Rngs(0)
         del rngs  # values come from the checkpoint, never random
-        self.weight = nnx.Param(
-            jnp.zeros((num_embeddings, features), dtype=jnp.uint8))
-        self.table_scale = nnx.Param(jnp.zeros((), dtype=jnp.float32))
 
     def __call__(self, ids: jax.Array) -> jax.Array:
-        rows = self.weight.value[ids].view(jnp.float8_e4m3fn)
-        return rows.astype(jnp.float32) * self.table_scale.value
+        table = PLE_HOST_TABLES.get(self.host_key)
+        if table is None:
+            raise RuntimeError(
+                f"PLE host table {self.host_key!r} not loaded: weight_loader "
+                f"fills PLE_HOST_TABLES at load; serving without it is a "
+                f"pipeline bug, not a missing checkpoint.")
+        n, hd = int(ids.shape[0]), int(self.features)
+
+        def _gather(ids_np):
+            rows = table[ids_np.reshape(-1)]
+            assert tuple(rows.shape) == (n, hd), (rows.shape, (n, hd))
+            return rows
+
+        return _host_callback(
+            _gather, jax.ShapeDtypeStruct((n, hd), jnp.bfloat16), ids)
+
 
 _init = nnx.initializers.uniform()
 MASK64 = (1 << 64) - 1
@@ -425,16 +462,16 @@ class Qwen4ExpPLE(JaxModule):
         self.sizes = jnp.asarray(sizes, dtype=jnp.int32)
         self.offsets = jnp.asarray(offsets, dtype=jnp.int32)
         total_rows = ple_padded_rows(sizes, divisible_by)
-        # INT4-residency serving: the n-gram table (320M rows x head_dim,
-        # ~51 GB as fp8) lives in HBM as fp8 codes + one global fp32 scale
-        # and is dequantized per lookup. A full-precision copy (102-205 GB)
-        # cannot fit v5e-8 HBM alongside the body. JAX name stays
-        # ``...ple.embedding.weight`` (fp8) + ``...ple.embedding.table_scale``.
-        self.embedding = PLEFp8Table(
+        # Host-RAM residency (upstream VLLM_PLE_CPU_OFFLOAD): the n-gram
+        # table (320M rows x head_dim, ~102 GB bf16) lives in
+        # PLE_HOST_TABLES, never in HBM. ``num_embeddings`` stays as the
+        # shape contract the loader validates against.
+        self.embedding = PLEHostTable(
             num_embeddings=total_rows,
             features=self.head_dim,
             rngs=rngs,
             prefix=prefix + ".embedding",
+            host_key=prefix + ".embedding",
         )
         wide = hidden_size * hc_count
         # Merged kv: [ple_embed_dim] -> [HC*H + H]. NOTE: attribute is ``kv``

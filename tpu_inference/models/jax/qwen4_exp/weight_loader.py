@@ -38,6 +38,8 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Tuple
 
+import ml_dtypes
+
 # HF -> JAX prefix map (ordered; first match wins for exact prefixes).
 PREFIX_MAP: List[Tuple[str, str]] = [
     ("model.language_model.", "model."),
@@ -243,8 +245,10 @@ TRANSPOSE_SUBSTR = (
 # - 3D fused experts (exp_gate_up [H,E,2I], exp_down [E,I,H]): exact JAX
 #   layout (the loader leaves ndim != 2 untouched).
 # - 1D norms/scales/biases: as stored.
-# - PLE n-gram table ``ple.embedding.weight`` [rows, hd]: the loader would
-#   transpose any 2D tensor, so it is yielded pre-transposed (a view, free).
+# - PLE n-gram table: NEVER yielded. It is dequantized (fp8 x global
+#   scale) into a bf16 HOST buffer (``PLE_HOST_TABLES``) instead of HBM
+#   (upstream ``VLLM_PLE_CPU_OFFLOAD`` design); forward gathers rows on
+#   the host. See the end-of-stream table block.
 # ---------------------------------------------------------------------------
 
 # JAX 1D-norm params whose checkpoint names differ from the JAX attribute
@@ -322,9 +326,10 @@ def expected_jax_names(arch):
         p = f"model.layers.{i}"
         lt = list(arch.layer_types)[i] if arch.layer_types else None
         if (i + 1) in ple_ids:
-            names += [f"{p}.ple.embedding.weight",
-                      f"{p}.ple.embedding.table_scale",
-                      f"{p}.ple.kv.weight",
+            # NOTE: the n-gram table itself is NOT a JAX param: it lives in
+            # host RAM (PLE_HOST_TABLES, upstream VLLM_PLE_CPU_OFFLOAD
+            # design), so no ple.embedding.* names appear here.
+            names += [f"{p}.ple.kv.weight",
                       f"{p}.ple.norm_key_w", f"{p}.ple.norm_query_w",
                       f"{p}.ple.norm_conv_w", f"{p}.ple.conv_w"]
         if lt == "linear_attention":
@@ -439,8 +444,7 @@ def sharding_spec_for(jax_name, shape):
     if ".mlp.exp_" in jax_name:
         # NVFP4 triplets [E, ...]: shard experts over TP axis (EP=1).
         return P("model", *((None,) * (ndim - 1)))
-    if jax_name.endswith((".embed_tokens.weight",
-                           ".ple.embedding.weight")):
+    if jax_name.endswith(".embed_tokens.weight"):
         return P("model", None)
     if jax_name.endswith(".down_block_inject.weight"):
         # HC merged down projection [HC*H=10240, lowrank+HC=324]: the out
@@ -464,12 +468,45 @@ def sharding_spec_for(jax_name, shape):
 
 
 def _is_table_tensor(mapped):
-    """PLE n-gram table pieces (102 GB; host-side in phase 2, skipped here).
+    """PLE n-gram table pieces (fp8 shards + global scale).
 
     Matches pre- or post-rename (map_checkpoint_name rewrites
-    ple_embedding -> embedding), so key on ngram_embedding only.
+    ple_embedding -> embedding), so key on ngram_embedding only. These
+    never become JAX params: the end-of-stream block dequantizes them
+    into the bf16 host buffer (``PLE_HOST_TABLES``).
     """
     return "ngram_embedding" in mapped
+
+
+def _host_table_layout(arch, layer_idx):
+    """(total_rows, head_dim) for one PLE layer's host table from ``arch``.
+
+    Row count is ``ple_padded_rows`` over the prime vocab sizes for this
+    layer's dense id (1-based ``ple_layer_ids`` -> 0-based index); head
+    dim is ``ple_embed_dim`` split over the n-gram heads. Pure Python
+    (shapes must stay concrete).
+    """
+    from .ngram import ple_padded_rows, ple_vocab_sizes_offsets
+
+    dense_ids = sorted(int(v) for v in (getattr(arch, "ple_layer_ids", [])
+                                        or []))
+    if (int(layer_idx) + 1) not in dense_ids:
+        raise ValueError(
+            f"LOAD-FAIL table for non-PLE layer {layer_idx} "
+            f"(ple_layer_ids={dense_ids})")
+    dense_id = dense_ids.index(int(layer_idx) + 1)
+    ngram_size = int(arch.ngram_size)
+    hpng = int(arch.heads_per_ngram)
+    heads = (ngram_size - 1) * hpng
+    hd = int(arch.ple_embed_dim) // heads
+    if int(arch.ple_embed_dim) % heads:
+        raise ValueError(
+            f"LOAD-FAIL ple_embed_dim {arch.ple_embed_dim} not divisible "
+            f"by {heads} n-gram heads")
+    div = int(arch.make_ngram_vocab_size_divisible_by)
+    sizes, _ = ple_vocab_sizes_offsets(
+        ngram_size, hpng, int(arch.ngram_vocab_size_base), div, dense_id)
+    return ple_padded_rows(sizes, div), hd
 
 
 def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
@@ -477,11 +514,15 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
                            log=None):
     """Yield ``(jax_name, torch_tensor)`` ready for JaxAutoWeightsLoader.
 
-    Quantized triplets (MoE NVFP4) and the fp8 PLE table bypass the
-    auto-loader (its 2D transpose would corrupt them) and are returned via
-    ``report["direct_tensors"]`` for exact direct assignment; ``report``
-    also carries ``filled``, ``missing``, ``unconsumed``, ``dropped``,
-    ``dequantized`` for the load report artifact.
+    Quantized triplets (MoE NVFP4) bypass the auto-loader (its 2D
+    transpose would corrupt them) and are returned via
+    ``report["direct_tensors"]`` for exact direct assignment. The PLE
+    n-gram table never leaves the host: fp8 shards x global scale are
+    dequantized into the bf16 ``PLE_HOST_TABLES`` buffer (upstream
+    ``VLLM_PLE_CPU_OFFLOAD`` design) and reported under
+    ``report["host_tables"]``. ``report`` also carries ``filled``,
+    ``missing``, ``unconsumed``, ``dropped``, ``dequantized`` for the
+    load report artifact.
 
     Args:
         weights: iterable of ``(ckpt_name, torch_tensor)`` (raw names).
@@ -676,7 +717,6 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
         return None
 
     def _emit(jax_name, tensor):
-        tensor = _maybe_pretranspose(jax_name, tensor)
         filled.add(jax_name)
         return jax_name, _maybe_bf16(jax_name, tensor)
 
@@ -872,8 +912,9 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
             rep["dropped"][mapped] = rep["dropped"].get(mapped, 0) + 1
             continue
         if _is_table_tensor(mapped):
-            # Buffer fp8 table shards + global scale (51 GB host transient);
-            # concatenated once at end of stream (numeric shard order).
+            # Buffer fp8 table shards + global scale; converted to the bf16
+            # host buffer at end of stream (order-free: filled by shard
+            # index into the preallocated host rows).
             li = _table_layer(mapped)
             if li is None:
                 raise ValueError(
@@ -994,7 +1035,15 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
                 for k, v in acc.items()}
         rep["unconsumed"].append(
             f"EXPERTS_NVFP4:{layer_base}={have}")
-    # PLE table: concat buffered fp8 shards (numeric order) + global scale.
+    # PLE table: fp8 shards x global scale -> bf16 HOST buffer
+    # (``PLE_HOST_TABLES``), never HBM (upstream ``VLLM_PLE_CPU_OFFLOAD``
+    # design). Converted shard-by-shard into preallocated host rows, so
+    # the peak is ~102 GB host + resident torch shards, and order is free
+    # (each shard lands at its own index; no concat copy).
+    import numpy as _np
+    from .ngram import PLE_HOST_TABLES
+
+    host_tables: Dict[str, tuple] = {}
     for key in sorted(table_bufs):
         buf = table_bufs[key]
         idxs = sorted(buf["shards"])
@@ -1004,26 +1053,46 @@ def iter_jax_named_weights(weights, arch, jax_names, report=None, *,
                 f"({len(idxs)} pieces)")
         if buf["scale"] is None:
             raise ValueError(f"LOAD-FAIL {key}: table scale missing")
-        table = _torch.cat([buf["shards"][i] for i in idxs],
-                           dim=0).contiguous()
         if int(buf["scale"].numel()) != 1:
             raise ValueError(
                 f"LOAD-FAIL {key}: table scale must be scalar, got "
                 f"{tuple(buf['scale'].shape)}")
-        wname = key + ".weight"
-        sname = key + ".table_scale"
-        for jax_name, tensor in (
-                (wname, table),
-                (sname, buf["scale"].reshape(()).to(_torch.float32))):
-            if jax_name not in jax_set:
+        scale = float(buf["scale"].reshape(-1)[0].to(_torch.float32).item())
+        li = _table_layer(key)
+        if li is None:
+            raise ValueError(f"LOAD-FAIL table key without layer: {key}")
+        total_rows, hd = _host_table_layout(arch, li)
+        first = buf["shards"][idxs[0]]
+        if first.ndim != 2 or first.dtype != _torch.float8_e4m3fn:
+            raise ValueError(
+                f"LOAD-FAIL {key}: shard must be 2D fp8_e4m3, got "
+                f"{tuple(first.shape)} {first.dtype}")
+        rps, shard_hd = (int(d) for d in first.shape)
+        if shard_hd != hd or total_rows % rps != 0 \
+                or len(idxs) != total_rows // rps:
+            raise ValueError(
+                f"LOAD-FAIL {key}: shards {[tuple(buf['shards'][i].shape) for i in idxs[:4]]}... "
+                f"do not tile host layout {(total_rows, hd)}")
+        host = _np.empty((total_rows, hd), dtype=ml_dtypes.bfloat16)
+        for i in idxs:
+            s = buf["shards"][i]
+            if tuple(s.shape) != (rps, hd):
                 raise ValueError(
-                    f"LOAD-FAIL table target {jax_name} matches no JAX param")
-            filled.add(jax_name)
-            direct[jax_name] = tensor
+                    f"LOAD-FAIL {key}: shard {i} shape {tuple(s.shape)} != "
+                    f"{(rps, hd)}")
+            # fp8 -> fp32 (exact widen) x global scale, then round to bf16
+            # on the host. fp32 transient per shard (~1.6 GB), never HBM.
+            chunk = (s.to(_torch.float32) * scale).numpy()
+            host[i * rps:(i + 1) * rps] = chunk.astype(ml_dtypes.bfloat16)
+            del buf["shards"][i]
+            del chunk
+        PLE_HOST_TABLES[key] = host
+        host_tables[key] = tuple(host.shape)
         rep["assembled"] += 1
-        _log(f"LOAD-OK {key}: table concat {tuple(table.shape)} "
-             f"({len(idxs)} shards)")
+        _log(f"LOAD-OK {key}: host bf16 table {tuple(host.shape)} "
+             f"({len(idxs)} shards, scale={scale})")
         del buf["shards"]
+    rep["host_tables"] = host_tables
     jax_set = set(jax_names)
     for ckpt_name in sorted(singles):
         jax_name = _jax_name_for(ckpt_name, jax_set)
@@ -1112,15 +1181,6 @@ def _is_identity_g_idx(g_idx, group_size):
         return bool((g == 0).all())
     expect = torch.arange(n, dtype=g.dtype) // group_size
     return bool((g == expect).all())
-
-
-def _maybe_pretranspose(jax_name, tensor):
-    # The auto-loader transposes every 2D tensor. Params whose JAX layout
-    # already equals the stored layout (PLE n-gram table) are yielded
-    # pre-transposed (a view, no copy).
-    if jax_name.endswith(".ple.embedding.weight") and tensor.ndim == 2:
-        return tensor.T
-    return tensor
 
 
 __all__ = [

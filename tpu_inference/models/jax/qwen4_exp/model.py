@@ -424,6 +424,7 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
             "autoloader_loaded": sorted(loaded),
             "direct": direct_names,
             "direct_count": len(direct_names),
+            "host_tables": report.get("host_tables", {}),
             "missing": missing,
             "missing_count": len(missing),
             "unconsumed_count": len(unconsumed),

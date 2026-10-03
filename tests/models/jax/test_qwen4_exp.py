@@ -796,7 +796,9 @@ def test_loader_heuristic_audit():
         assert any(n.endswith(".mlp." + s) for n in names), s
     assert not any(n.endswith(".mlp.exp_gate_up") for n in names)
     assert not any(n.endswith(".mlp.exp_down") for n in names)
-    assert any(n.endswith(".ple.embedding.table_scale") for n in names)
+    # The n-gram table is not a JAX param (host RAM, VLLM_PLE_CPU_OFFLOAD
+    # design): no ple.embedding.* names in the inventory.
+    assert not any(".ple.embedding." in n for n in names)
 
 
 @requires_impl
@@ -1037,7 +1039,7 @@ def test_nvfp4_jax_matches_torch_bit_exact():
 
 @requires_impl
 def test_nvfp4_expert_assembly_and_dense_gaps():
-    """NVFP4 experts + qkv concat + mixer zero-fill + table zeros."""
+    """NVFP4 experts + qkv concat + mixer zero-fill + table host fill."""
     torch = pytest.importorskip("torch")
     from tpu_inference.models.jax.qwen4_exp import weight_loader as wl_mod
 
@@ -1045,7 +1047,10 @@ def test_nvfp4_expert_assembly_and_dense_gaps():
     arch = SimpleNamespace(num_experts=2, hidden_size=32,
                            moe_intermediate_size=16, num_attention_heads=2,
                            head_dim=8, num_key_value_heads=1, hc_count=2,
-                           hc_lowrank=4)
+                           hc_lowrank=4, ple_layer_ids=[1], ngram_size=2,
+                           heads_per_ngram=1, ple_embed_dim=8,
+                           ngram_vocab_size_base=1000,
+                           make_ngram_vocab_size_divisible_by=16)
     LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5,
            -2.0, -3.0, -4.0, -6.0)
 
@@ -1082,10 +1087,16 @@ def test_nvfp4_expert_assembly_and_dense_gaps():
     # mixer down only (inject zero-filled): down rows = hc_lowrank = 4
     stream += [("model.hyper_connection_mixer.input_mix_weight_down.weight",
                 torch.randn(4, 64))]
-    # table shards fp8 (concatenated in numeric order) + global scale
-    stream += [(f"model.layers.0.ple.ple_embedding.ngram_embedding.shard_{i}.weight",
-                torch.randint(0, 256, (5, 8), dtype=torch.uint8))
-               for i in range(3)]
+    # table shards fp8 (index-based fill: emitted out of order on purpose)
+    # + global scale. Finite codes only (<0x79; 0x79+ are NaN in e4m3).
+    tgen = torch.Generator().manual_seed(1)
+    trows = {}
+    for i in (2, 0, 3, 1):
+        codes = torch.randint(0, 0x79, (256, 8), generator=tgen,
+                              dtype=torch.uint8)
+        trows[i] = codes
+        stream += [(f"model.layers.0.ple.ple_embedding.ngram_embedding.shard_{i}.weight",
+                    codes.view(torch.float8_e4m3fn))]
     stream += [("model.layers.0.ple.ple_embedding.ngram_embedding.weight_scale",
                 torch.tensor(0.5))]
     jax_names = ["model.layers.0.mlp.exp_gate_w",
@@ -1098,9 +1109,7 @@ def test_nvfp4_expert_assembly_and_dense_gaps():
                  "model.layers.0.mlp.exp_down_sc",
                  "model.layers.0.mlp.exp_down_g",
                  "model.layers.0.self_attn.qkv.weight",
-                 "model.hyper_connection_mixer.down_block_inject.weight",
-                 "model.layers.0.ple.embedding.weight",
-                 "model.layers.0.ple.embedding.table_scale"]
+                 "model.hyper_connection_mixer.down_block_inject.weight"]
     rep = {}
     out = dict(wl_mod.iter_jax_named_weights(
         iter(stream), arch, jax_names, report=rep,
@@ -1134,15 +1143,24 @@ def test_nvfp4_expert_assembly_and_dense_gaps():
     assert torch.equal(mix[:4],
                        d["model.hyper_connection_mixer.input_mix_weight_down.weight"])
     assert bool((mix[4:] == 0).all())
-    # table concat (numeric shard order) + scalar scale
-    assert direct["model.layers.0.ple.embedding.weight"].shape == (15, 8)
-    assert torch.equal(
-        direct["model.layers.0.ple.embedding.weight"][:5],
-        d["model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"])
-    assert torch.equal(
-        direct["model.layers.0.ple.embedding.weight"][10:],
-        d["model.layers.0.ple.ple_embedding.ngram_embedding.shard_2.weight"])
-    assert direct["model.layers.0.ple.embedding.table_scale"].shape == torch.Size([])
+    # table -> bf16 HOST buffer (fp8 x scale, host-rounded; the global
+    # registry is cleaned up so tests stay isolated).
+    import ml_dtypes
+
+    from tpu_inference.models.jax.qwen4_exp.ngram import PLE_HOST_TABLES
+
+    key = "model.layers.0.ple.embedding"
+    try:
+        assert key in rep.get("host_tables", {}), rep.get("host_tables")
+        assert key not in rep["direct_tensors"]
+        host = PLE_HOST_TABLES[key]
+        assert tuple(host.shape) == (1024, 8) and str(host.dtype) == "bfloat16"
+        ref = torch.cat(
+            [(trows[i].view(torch.float8_e4m3fn).to(torch.float32) * 0.5)
+             for i in range(4)], dim=0).numpy().astype(ml_dtypes.bfloat16)
+        np.testing.assert_array_equal(np.asarray(host), ref)
+    finally:
+        PLE_HOST_TABLES.pop(key, None)
 
 
 @requires_impl
@@ -1306,11 +1324,14 @@ def test_live_param_paths_match_loader_contract(mesh):
     names_lin = live_names(lin)
     for n in ("linear_attn.in_proj_qkvz.weight",
               "linear_attn.in_proj_ba.weight",
-              "ple.embedding.weight",
-              "ple.embedding.table_scale",
               "ple.kv.weight",
               "mlp_hyper_connection.down_block_inject.weight"):
         assert n in names_lin, n
+    # The n-gram table is NOT a JAX param (host RAM, upstream
+    # VLLM_PLE_CPU_OFFLOAD): no ple.embedding.* params, but the module
+    # carries the registry key the loader fills.
+    assert not any("ple.embedding" in n for n in names_lin), names_lin
+    assert lin.ple.embedding.host_key == "model.layers.1.ple.embedding"
 
     # The exact loader lookups that raised LOAD-FAIL on v58.
     jax_set = {"model.layers.0." + n for n in names}
@@ -1352,7 +1373,8 @@ def test_sharding_specs_divisible_by_tp():
         ("model.layers.0.mlp.exp_gate_w", (512, 640, 1280)),
         ("model.layers.0.mlp.exp_down_sc", (512, 2560, 40)),
         ("model.layers.0.ple.kv.weight", (2560, 12800)),
-        ("model.layers.1.ple.embedding.weight", (320001536, 160)),
+        # NOTE: no ple.embedding.weight case: the n-gram table is not a
+        # JAX param (host RAM, VLLM_PLE_CPU_OFFLOAD design), so no spec.
         ("model.embed_tokens.weight", (248320, 2560)),
         ("lm_head.weight", (248320, 2560)),
         ("model.layers.0.self_attn.q_norm_w", (256,)),
@@ -1460,32 +1482,47 @@ def test_direct_placement_ops(mesh):
 
 
 @requires_impl
-def test_ple_fp8_table_uint8_lookup(mesh):
-    """PLE table stores uint8 bits; lookup views gathered rows as fp8.
+def test_ple_host_table_lookup(mesh):
+    """Host-RAM table: gather-on-host returns looked-up rows (bf16).
 
-    A device-side view of the whole 51 GB table materializes a second
-    copy and OOMs at load (v74), so only gathered rows are ever viewed.
-    Known e4m3 codes (torch/JAX agree): 0x40=2.0, 0xC0=-2.0, 0x00=0.0,
-    0x38=1.0.
+    The table is never a device param (upstream ``VLLM_PLE_CPU_OFFLOAD``
+    design); ``__call__`` hashes nothing, just gathers flat ids on the
+    host and transfers rows. Known e4m3 codes (torch/JAX agree):
+    0x40=2.0, 0xC0=-2.0, 0x00=0.0, 0x38=1.0.
     """
+    import jax
     import jax.numpy as jnp
+    import ml_dtypes
     from flax import nnx
 
-    from tpu_inference.models.jax.qwen4_exp.ngram import PLEFp8Table
+    from tpu_inference.models.jax.qwen4_exp.ngram import (
+        PLE_HOST_TABLES,
+        PLEHostTable,
+    )
 
-    tab = PLEFp8Table(num_embeddings=4, features=4, rngs=nnx.Rngs(0))
-    assert str(tab.weight.value.dtype) == "uint8"
-    tab.weight.value = jnp.asarray(
-        [[0x40, 0xC0, 0x00, 0x38],
-         [0x00, 0x00, 0x00, 0x00],
-         [0x38, 0x38, 0x38, 0x38],
-         [0xC0, 0x40, 0x38, 0x00]], dtype=jnp.uint8)
-    tab.table_scale.value = jnp.asarray(2.0, dtype=jnp.float32)
-    got = tab(jnp.asarray([0, 2], dtype=jnp.int32))
-    np.testing.assert_allclose(
-        np.asarray(got, dtype=np.float32),
-        [[4.0, -4.0, 0.0, 2.0],
-         [2.0, 2.0, 2.0, 2.0]], rtol=1e-5)
+    key = "test.layers.0.ple.embedding"
+    PLE_HOST_TABLES[key] = np.asarray(
+        [[2.0, -2.0, 0.0, 1.0],
+         [0.0, 0.0, 0.0, 0.0],
+         [1.0, 1.0, 1.0, 1.0],
+         [-2.0, 2.0, 1.0, 0.0]], dtype=np.float32).astype(
+             ml_dtypes.bfloat16)
+    try:
+        tab = PLEHostTable(num_embeddings=4, features=4, rngs=nnx.Rngs(0),
+                           host_key=key)
+        assert tab.host_key == key
+        got = tab(jnp.asarray([0, 2], dtype=jnp.int32))
+        np.testing.assert_allclose(
+            np.asarray(got, dtype=np.float32),
+            [[2.0, -2.0, 0.0, 1.0],
+             [1.0, 1.0, 1.0, 1.0]], rtol=1e-2)
+        # Same through jit (trace-time static shapes, the serving case).
+        got_j = jax.jit(tab)(jnp.asarray([0, 2], dtype=jnp.int32))
+        np.testing.assert_allclose(
+            np.asarray(got_j, dtype=np.float32),
+            np.asarray(got, dtype=np.float32), rtol=1e-5)
+    finally:
+        PLE_HOST_TABLES.pop(key, None)
 
 
 @pytest.mark.skipif(os.environ.get("QWEN4EXP_E2E") != "1",
