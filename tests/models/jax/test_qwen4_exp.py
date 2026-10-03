@@ -1422,37 +1422,35 @@ def test_gdn_norm_matches_upstream_rmsnorm_gated(mesh):
 
 
 @requires_impl
-def test_torch_to_jax_host_roundtrip():
-    """Host-side torch->JAX conversion is bit-exact without XLA (v68).
+def test_torch_to_numpy_bits():
+    """Host handoff is bit-exact views, never device staging (v79).
 
-    v68 died converting the 51 GB fp8 table via ``t2j`` (95 GB then
-    381 GB HLO temporaries -> RESOURCE_EXHAUSTED). Direct tensors now
-    cross on the host; fp8 has no numpy dtype so it travels as uint8
-    bits and is viewed back.
+    v79 died with 48.94 MB free per chip on a 50 MB staging alloc, so
+    direct tensors cross as numpy views (fp8 as uint8 bits) into
+    ``device_put`` sharded transfer. Non-contiguous input included.
     """
     torch = pytest.importorskip("torch")
-    import jax.numpy as jnp
 
     from tpu_inference.models.jax.qwen4_exp.weight_loader import (
-        torch_to_jax_host,
+        torch_to_numpy_bits,
     )
 
     rng = torch.Generator().manual_seed(0)
     w8 = (torch.randint(0, 256, (65, 130), generator=rng,
                        dtype=torch.uint8).t() + 0).contiguous().t()
     assert not w8.is_contiguous()
-    j8 = torch_to_jax_host(w8)
-    assert tuple(j8.shape) == (65, 130) and str(j8.dtype) == "uint8"
-    np.testing.assert_array_equal(np.asarray(j8), w8.contiguous().numpy())
+    n8, is_fp8 = torch_to_numpy_bits(w8)
+    assert not is_fp8 and n8.dtype == np.uint8
+    np.testing.assert_array_equal(n8, w8.contiguous().numpy())
     f8 = torch.randint(0, 256, (17, 40), generator=rng,
                        dtype=torch.uint8).view(torch.float8_e4m3fn)
-    jf = torch_to_jax_host(f8)
-    assert str(jf.dtype) == "float8_e4m3fn"
-    np.testing.assert_array_equal(
-        np.asarray(jf.view(jnp.uint8)), np.asarray(f8.view(torch.uint8)))
+    nf, is_fp8 = torch_to_numpy_bits(f8)
+    assert is_fp8 and nf.dtype == np.uint8
+    np.testing.assert_array_equal(nf, np.asarray(f8.view(torch.uint8)))
     f4 = torch.randn(9, 33, generator=rng)
-    j4 = torch_to_jax_host(f4)
-    np.testing.assert_array_equal(np.asarray(j4), f4.numpy())
+    n4, is_fp8 = torch_to_numpy_bits(f4)
+    assert not is_fp8
+    np.testing.assert_array_equal(n4, f4.numpy())
 
 
 @requires_impl

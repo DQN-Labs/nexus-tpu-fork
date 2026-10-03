@@ -89,25 +89,23 @@ from .layers import Qwen4ExpDecoderLayer
 
 _init = nnx.initializers.uniform()
 
-#: Tensors at or above this size are placed via sharded ``device_put``
-#: straight from the host numpy buffer (v70: even ``jnp.asarray`` of the
-#: 51 GB table staged 95 GB of HBM temporaries inside the TPU worker).
-_DIRECT_SHARD_THRESHOLD = 256 << 20
-
 
 def _assign_direct(param, tensor, name, mesh, spec):
     """Assign one direct (quantized-residency) tensor without HBM staging.
 
-    Small tensors convert whole on the host (bounded by
-    ``_DIRECT_SHARD_THRESHOLD``). Large ones go host numpy ->
-    ``jax.device_put`` under the param's sharding, which slices host-side
-    during transfer in the sharding's own device order (never a whole
-    array on device, and no hand-ordered shards that could silently
-    misplace rows -- the mesh order is topology order, e.g.
+    Host numpy -> ``jax.device_put`` under the param's sharding, which
+    slices host-side during transfer in the sharding's own device order
+    (never a whole array on device, and no hand-ordered shards that could
+    silently misplace rows -- the mesh order is topology order, e.g.
     [0,1,2,3,7,6,5,4], not sorted). fp8 has no numpy dtype so it crosses
-    as uint8 bits with one metadata-only ``view`` on the already
-    mesh-conformant array (a ``view`` on single-device buffers dies under
-    the ambient mesh context -- diagnosed 2026-09-29, v72).
+    as uint8 bits with one ``view`` on the already mesh-conformant array
+    (a ``view`` on single-device buffers dies under the ambient mesh
+    context -- diagnosed 2026-09-29, v72).
+
+    Uniform path for ALL sizes (no whole-array branch): v79 died with
+    48.94 MB free per chip, where even a 50 MB staging alloc fails, so
+    nothing here may transiently replicate a full tensor on device
+    (v68/v70: 95-381 GB temporaries; v79: 50 MB vs 48.94 MB free).
     """
     import jax
     import jax.numpy as jnp
@@ -116,23 +114,18 @@ def _assign_direct(param, tensor, name, mesh, spec):
     from tpu_inference.models.jax.utils.weight_utils import (
         assign_and_shard_param,
     )
-    from .weight_loader import torch_to_jax_host
+    from .weight_loader import torch_to_numpy_bits
 
-    t = tensor.detach().to("cpu")
-    if not t.is_contiguous():
-        t = t.contiguous()
-    sharding = NamedSharding(mesh, spec) if mesh is not None else None
-    if sharding is None or t.numel() * t.element_size() < _DIRECT_SHARD_THRESHOLD:
-        assign_and_shard_param(param, torch_to_jax_host(t), name)
-        return
-    is_fp8 = t.dtype == torch.float8_e4m3fn
-    raw = (t.view(torch.uint8).numpy() if is_fp8 else t.numpy())
-    placed = jax.device_put(raw, sharding)
+    raw, is_fp8 = torch_to_numpy_bits(tensor)
+    if mesh is None:
+        raise RuntimeError(
+            f"LOAD-FAIL {name}: direct assign needs the runner mesh")
+    placed = jax.device_put(raw, NamedSharding(mesh, spec))
     if is_fp8 and param.value.dtype == jnp.float8_e4m3fn:
         # Small fp8 params only (e.g. MoE scales, ~26 MB): the view
-        # materializes a copy, which is fine at this size. The 51 GB PLE
-        # table param is uint8 (viewed per lookup in forward), so a table
-        # bitcast here would OOM (v74) -- assign the bits directly.
+        # materializes a copy, which is fine at this size. (The 51 GB PLE
+        # table no longer takes this path at all -- host RAM -- but any
+        # future giant fp8 param must stay uint8-sharded like it.)
         placed = placed.view(jnp.float8_e4m3fn)
     try:
         assign_and_shard_param(param, placed, name)
