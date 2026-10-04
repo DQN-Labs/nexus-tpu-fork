@@ -52,8 +52,12 @@ QUANT_SKIP_SUBSTR = (
 )
 
 IGNORED_MISSING_SUFFIXES = (
+    # Plain ".bias" only: attention_bias=False linears and the unused
+    # vision tower carry bias tensors we never load. Do NOT add "_bias":
+    # it silently swallows GDN's dt_bias (a real, needed param --
+    # diagnosed 2026-10-04, v80: 36 missing dt_bias with zero
+    # unconsumed counterpart because drops never surface there).
     ".bias",
-    "_bias",
     ".k_scale",
     "_k_scale",
     ".v_scale",

@@ -163,6 +163,11 @@ def is_ignored_missing(name: str) -> bool:
 
     if "hyper_connection_mixer.block_inject_weight" in name:
         return True
+    # Text-only serving: the vision tower has no JAX params. Ignoring it
+    # (instead of merely leaving it unconsumed) keeps LOAD-UNCONSUMED
+    # readable for real issues (~167 visual tensors per load).
+    if ".visual." in name:
+        return True
     # MTP draft-model tensors (mtp.*): our MTP is a stub sharing the target
     # trunk (model.py::Qwen4ExpMTP), so draft-only weights such as
     # mtp.layers.N.mlp.experts.{down_proj,gate_up_proj} are never loaded.
@@ -268,7 +273,10 @@ _NORM_CANDIDATES = (
     ("norm_w", (".norm.weight", ".norm_w", ".rms_norm.weight")),
     ("conv_w", (".conv_w", ".conv1d.weight", ".conv.weight",
                 ".depthwise_conv.weight")),
-    ("conv_weight", (".conv_weight", ".conv.weight",
+    # NOTE: ".conv1d.weight" is NOT listed here: PLE's conv1d maps via the
+    # conv_w entry above (tuple order: first hit wins), while GDN's conv1d
+    # is the 3D conv_weight param (v80: 36 missing conv_weight).
+    ("conv_weight", (".conv_weight", ".conv1d.weight", ".conv.weight",
                      ".causal_conv.weight", ".conv_weight.weight")),
 )
 
@@ -357,7 +365,8 @@ def expected_jax_names(arch):
             if int(getattr(arch, "shared_expert_intermediate_size", 0) or 0) > 0:
                 names += [f"{p}.mlp.shared_expert.gate_proj.weight",
                           f"{p}.mlp.shared_expert.up_proj.weight",
-                          f"{p}.mlp.shared_expert.down_proj.weight"]
+                          f"{p}.mlp.shared_expert.down_proj.weight",
+                          f"{p}.mlp.shared_expert_gate.weight"]
         else:
             names += [f"{p}.mlp.gate_proj.weight",
                       f"{p}.mlp.up_proj.weight",
@@ -454,6 +463,11 @@ def sharding_spec_for(jax_name, shape):
         # fp32 is 13 MB/chip and replication is comm-free at use (each chip
         # holds full rows for its T-sharded activations), unlike row
         # sharding which would force an all-gather per HC mix.
+        return P()
+    if jax_name.endswith(".shared_expert_gate.weight"):
+        # Router gate for the shared expert [H, 1]: out dim 1 is not
+        # divisible by TP=8 (model.py's generic guard would downgrade it
+        # with a warning); 10 KB, replicate outright.
         return P()
     _ROW_PARALLEL = (".mlp.down_proj.weight",
                      ".mlp.shared_expert.down_proj.weight",

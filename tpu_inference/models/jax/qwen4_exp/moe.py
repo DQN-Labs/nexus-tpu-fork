@@ -158,6 +158,15 @@ class Qwen4ExpMoE(JaxModule):
             self.shared_expert = Qwen4ExpMLP(
                 hidden_size, shared_intermediate_size,
                 rngs=rngs, prefix=prefix + ".shared_expert")
+            # Upstream Qwen3NextSparseMoeBlock.shared_expert_gate:
+            # Linear(H, 1, bias=False); the shared branch is scaled by
+            # sigmoid(gate(x)) before the residual add (v80: 48 missing
+            # params, and silently ungated shared experts until now).
+            self.shared_expert_gate = JaxEinsum(
+                "TD,DK->TK", (hidden_size, 1),
+                param_dtype=jnp.float32,
+                kernel_init=nnx.with_partitioning(_init, (None, "model")),
+                rngs=rngs, prefix=prefix + ".shared_expert_gate")
 
     def route(
         self, x: jax.Array
@@ -206,7 +215,12 @@ class Qwen4ExpMoE(JaxModule):
         out = jax.vmap(token_moe)(xf, weights.astype(jnp.float32), idx)
         out = out.astype(x.dtype)
         if self.n_shared_experts:
-            out = out + self.shared_expert(x)
+            # Upstream: sigmoid(gate(x)) * shared_expert(x), then add.
+            sgate = jax.nn.sigmoid(jnp.einsum(
+                "TD,DK->TK", xf,
+                self.shared_expert_gate.weight.value.astype(jnp.float32),
+            )).astype(x.dtype)
+            out = out + self.shared_expert(x) * sgate
         return out, logits
 
 

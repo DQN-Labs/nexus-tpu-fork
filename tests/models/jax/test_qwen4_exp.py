@@ -132,6 +132,25 @@ def test_weight_name_mapping():
     assert m == "model.layers.3.ple.embedding.weight"
     assert wl_mod.stacked_target("model.layers.0.ple.key_proj.weight")[1] == 0
     assert wl_mod.stacked_target("model.layers.0.ple.value_proj.weight")[1] == 1
+    # v80 gaps: GDN conv1d maps to the 3D conv_weight param (PLE's conv1d
+    # still resolves to conv_w: tuple order, first hit wins), dt_bias is a
+    # real param (must not be ignore-swallowed), shared_expert_gate is an
+    # exact-name passthrough, and the vision tower is ignored (text-only).
+    m = wl_mod.map_checkpoint_name("model.layers.3.linear_attn.conv1d.weight")
+    assert m == "model.layers.3.linear_attn.conv1d.weight"
+    assert wl_mod._jax_name_for(
+        m, {"model.layers.3.linear_attn.conv_weight"}) == \
+        "model.layers.3.linear_attn.conv_weight"
+    m = wl_mod.map_checkpoint_name("model.layers.3.ple.conv1d.weight")
+    assert wl_mod._jax_name_for(
+        m, {"model.layers.3.ple.conv_w"}) == "model.layers.3.ple.conv_w"
+    assert not wl_mod.is_ignored_missing(
+        "model.layers.0.linear_attn.dt_bias")
+    assert wl_mod.is_ignored_missing(
+        "model.visual.blocks.0.attn.qkv.weight")
+    assert wl_mod.map_checkpoint_name(
+        "model.layers.3.mlp.shared_expert_gate.weight") == \
+        "model.layers.3.mlp.shared_expert_gate.weight"
     remapped = wl_mod.remap_qsa_scale_name(
         "model.layers.5.self_attn.k_proj.k_scale", frozenset({5}))
     assert remapped.endswith("self_attn._k_scale")
@@ -344,6 +363,50 @@ def test_moe_triplet_forward_matches_fused_reference(mesh):
     fj = jax.jit(lambda a: moe(a)[0])
     # Eager-vs-jit XLA reassociation noise only (correctness pinned above).
     np.testing.assert_allclose(np.asarray(fj(x)), np.asarray(out), rtol=1e-4)
+
+
+@requires_impl
+def test_moe_shared_expert_gate(mesh):
+    """Shared branch == sigmoid(gate(x)) * shared_mlp(x) (upstream exact).
+
+    v80: the gate param was missing (48x) and the shared expert was added
+    ungated. Routed path zeroed via zero triplets so the shared branch is
+    isolated against a from-scratch reference built from live weights.
+    """
+    import jax
+    from flax import nnx
+
+    from tpu_inference.models.jax.qwen4_exp.moe import Qwen4ExpMoE, silu
+
+    H, I, S, E = 16, 8, 8, 2
+    moe = Qwen4ExpMoE(hidden_size=H, moe_intermediate_size=I,
+                      shared_intermediate_size=S, num_experts=E,
+                      num_experts_per_tok=1, rngs=nnx.Rngs(3))
+    assert tuple(moe.shared_expert_gate.weight.value.shape) == (H, 1)
+    for n, sh in (("exp_gate_w", (E, I, H // 2)),
+                  ("exp_up_w", (E, I, H // 2)),
+                  ("exp_down_w", (E, H, I // 2))):
+        getattr(moe, n).value = jnp.zeros(sh, dtype=jnp.uint8)
+    rng = np.random.default_rng(7)
+    moe.shared_expert_gate.weight.value = jnp.asarray(
+        rng.normal(size=(H, 1)).astype(np.float32))
+    x = jnp.asarray(rng.normal(size=(3, H)).astype(np.float32))
+    out, _ = moe(x)
+    xn = np.asarray(x, dtype=np.float32)
+    Wg = np.asarray(moe.shared_expert_gate.weight.value, dtype=np.float32)
+    Wgp = np.asarray(moe.shared_expert.gate_proj.weight.value,
+                     dtype=np.float32)
+    Wup = np.asarray(moe.shared_expert.up_proj.weight.value,
+                     dtype=np.float32)
+    Wd = np.asarray(moe.shared_expert.down_proj.weight.value,
+                    dtype=np.float32)
+    s = silu(xn @ Wgp) * (xn @ Wup)
+    ref = (1.0 / (1.0 + np.exp(-(xn @ Wg)))) * (s @ Wd)
+    np.testing.assert_allclose(np.asarray(out, dtype=np.float32), ref,
+                               rtol=1e-4, atol=1e-4)
+    fj = jax.jit(lambda a: moe(a)[0])
+    np.testing.assert_allclose(np.asarray(fj(x)), np.asarray(out),
+                               rtol=1e-4)
 
 
 @requires_impl
@@ -796,6 +859,7 @@ def test_loader_heuristic_audit():
         assert any(n.endswith(".mlp." + s) for n in names), s
     assert not any(n.endswith(".mlp.exp_gate_up") for n in names)
     assert not any(n.endswith(".mlp.exp_down") for n in names)
+    assert any(n.endswith(".mlp.shared_expert_gate.weight") for n in names)
     # The n-gram table is not a JAX param (host RAM, VLLM_PLE_CPU_OFFLOAD
     # design): no ple.embedding.* names in the inventory.
     assert not any(".ple.embedding." in n for n in names)
@@ -1310,7 +1374,8 @@ def test_live_param_paths_match_loader_contract(mesh):
               "mlp.gate.weight",
               "mlp.exp_gate_w",
               "mlp.shared_expert.gate_proj.weight",
-              "mlp.shared_expert.down_proj.weight"):
+              "mlp.shared_expert.down_proj.weight",
+              "mlp.shared_expert_gate.weight"):
         assert n in names, n
     for n in names:
         segs = n.split(".")
