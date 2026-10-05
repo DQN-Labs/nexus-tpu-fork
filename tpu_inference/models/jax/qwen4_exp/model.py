@@ -454,7 +454,12 @@ class Qwen4ExpForCausalLM(JaxModule, LoadableWithIterator):
             raise RuntimeError(
                 f"LOAD-FAIL {len(missing)} JAX params unfilled "
                 f"(first 20: {missing[:20]})")
-        return loaded
+        # The framework's track_weights_loading() validates THIS return
+        # value: direct-assigned params (NVFP4 triplets) bypassed its
+        # yield path, so without the union it reports all 432 triplets as
+        # uninitialized even though every value is placed (diagnosed
+        # 2026-10-05, v82: LOAD-REPORT 1306/1306 then framework raise).
+        return set(loaded) | set(direct_names)
 
 
 class Qwen4ExpMTP(JaxModule):
