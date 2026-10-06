@@ -1588,6 +1588,80 @@ def test_ple_host_table_lookup(mesh):
         PLE_HOST_TABLES.pop(key, None)
 
 
+@requires_impl
+def test_eval_shape_construction_has_no_struct_state(mesh):
+    """Abstract construction (the framework path) leaves no structs behind.
+
+    The serving framework builds the model under ``nnx.eval_shape``: every
+    array leaf starts as a ``ShapeDtypeStruct`` and only ``nnx.Param``
+    leaves get real values from ``load_weights``. A plain array
+    *attribute* (PLE ``sizes``/``offsets`` were int32[16] arrays) stays a
+    struct forever and kills ``create_jit_model``'s split (v84:
+    ``model.states[0][64]``). Such constants must be static (lists).
+    """
+    import jax
+    from flax import nnx
+    from types import SimpleNamespace
+
+    from tpu_inference.models.jax.qwen4_exp.layers import Qwen4ExpDecoderLayer
+
+    base = SimpleNamespace(
+        hidden_size=16, num_hidden_layers=2, num_attention_heads=2,
+        num_key_value_heads=2, head_dim=8, intermediate_size=32,
+        vocab_size=64, rms_norm_eps=1e-6, hidden_act="silu",
+        max_position_embeddings=64, rope_theta=10000.0,
+        partial_rotary_factor=0.5, attention_bias=False,
+        linear_conv_kernel_dim=4, linear_key_head_dim=8,
+        linear_value_head_dim=8, linear_num_key_heads=2,
+        linear_num_value_heads=2, decoder_sparse_step=1,
+        moe_intermediate_size=8, shared_expert_intermediate_size=8,
+        num_experts_per_tok=2, num_experts=4, norm_topk_prob=True,
+        mlp_only_layers=[], layer_types=None, hc_count=2, hc_lowrank=4,
+        ple_layer_ids=[2], ple_embed_dim=16, ple_conv_kernel_size=2,
+        ngram_size=3, heads_per_ngram=2, ngram_vocab_size_base=1000,
+        make_ngram_vocab_size_divisible_by=8, output_gate_type="sigmoid",
+        indexer_n_heads=2, indexer_kv_heads=1, indexer_head_dim=8,
+        indexer_budget=512, indexer_compress_ratio=1,
+    )
+    arch = cfg_mod.arch_from_hf_config(base, vocab_size=64)
+    arch.layer_types = ["full_attention", "linear_attention"]
+
+    # Version-independent pin: PLE sizes/offsets must be plain static
+    # lists, never JAX arrays. The framework builds the model under
+    # nnx.eval_shape (array leaves start as ShapeDtypeStructs until
+    # load_weights assigns Params); an array *attribute* is invisible to
+    # the loader, so on flax versions that keep bare arrays in module
+    # state it survives as a struct and kills create_jit_model's split
+    # (v84: int32[16] at model.states[0][64]).
+    lin_check = Qwen4ExpDecoderLayer(
+        arch=arch, layer_idx=1, dtype=jnp.float32,
+        rngs=nnx.Rngs(1), prefix="model.layers.1")
+    assert isinstance(lin_check.ple.sizes, list)
+    assert isinstance(lin_check.ple.offsets, list)
+    assert all(type(v) is int for v in lin_check.ple.sizes)
+    assert all(type(v) is int for v in lin_check.ple.offsets)
+
+    def _struct_paths(state):
+        out = {}
+        for p, v in jax.tree.leaves_with_path(state):
+            if isinstance(v, jax.ShapeDtypeStruct):
+                out[jax.tree_util.keystr(p)] = tuple(v.shape)
+        return out
+
+    for layer_idx in (0, 1):
+        layer = nnx.eval_shape(
+            lambda: Qwen4ExpDecoderLayer(
+                arch=arch, layer_idx=layer_idx, dtype=jnp.float32,
+                rngs=nnx.Rngs(0), prefix=f"model.layers.{layer_idx}"))
+        # Param leaves are abstract by design (load_weights fills them);
+        # anything else abstract is a loader-invisible struct that would
+        # survive into create_jit_model and kill its split.
+        all_s = _struct_paths(nnx.state(layer))
+        param_s = _struct_paths(nnx.state(layer, nnx.Param))
+        bad = {k: v for k, v in all_s.items() if k not in param_s}
+        assert bad == {}, bad
+
+
 @pytest.mark.skipif(os.environ.get("QWEN4EXP_E2E") != "1",
                     reason="needs TPU v5e-8 + checkpoint (QWEN4EXP_E2E=1)")
 def test_e2e_tpu():

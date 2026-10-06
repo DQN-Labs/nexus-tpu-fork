@@ -459,8 +459,15 @@ class Qwen4ExpPLE(JaxModule):
             ngram_size, heads_per_ngram, vocab_base, divisible_by,
             ple_dense_layer_id,
         )
-        self.sizes = jnp.asarray(sizes, dtype=jnp.int32)
-        self.offsets = jnp.asarray(offsets, dtype=jnp.int32)
+        # PLAIN PYTHON LISTS, deliberately not jnp arrays: the framework
+        # builds the model under nnx.eval_shape (abstract; every array leaf
+        # starts as a ShapeDtypeStruct until load_weights assigns it), and
+        # array *attributes* are invisible to the loader, so they would stay
+        # structs forever and kill create_jit_model's split (diagnosed
+        # 2026-10-06, v84: int32[16] struct at model.states[0][64]). Lists
+        # are static; forward converts them (tiny constants, see below).
+        self.sizes = [int(v) for v in sizes]
+        self.offsets = [int(v) for v in offsets]
         total_rows = ple_padded_rows(sizes, divisible_by)
         # Host-RAM residency (upstream VLLM_PLE_CPU_OFFLOAD): the n-gram
         # table (320M rows x head_dim, ~102 GB bf16) lives in
