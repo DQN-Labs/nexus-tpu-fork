@@ -76,6 +76,41 @@ def md_cell(src):
     return {'cell_type': 'markdown', 'source': src, 'metadata': {}}
 
 
+def fork_apply_cell():
+    """Build the fork_apply cell with the qwen4_exp leaf vendored in.
+
+    2026-10-09: GitHub answers anonymous git requests from Kaggle VMs with
+    auth-required (exit 128), so the tree ships as a base64 payload instead
+    of `git clone`. Byte-exact: the run executes what we pushed.
+    """
+    import base64
+    import subprocess
+    leaf = FORK / 'tpu_inference' / 'models' / 'jax' / 'qwen4_exp'
+    files = {}
+    for p in sorted(leaf.glob('*.py')):
+        files[p.name] = base64.b64encode(p.read_bytes()).decode()
+    assert len(files) >= 12 and '__init__.py' in files \
+        and 'model.py' in files, sorted(files)
+    commit = subprocess.check_output(
+        ['git', '-C', str(FORK), 'rev-parse', 'HEAD'], text=True).strip()
+    dirty = subprocess.check_output(
+        ['git', '-C', str(FORK), 'status', '--porcelain',
+         'tpu_inference/models/jax/qwen4_exp'],
+        text=True).strip()
+    if dirty:
+        print(f'WARNING: vendoring dirty leaf at {commit[:12]}:\n{dirty[:500]}')
+    template = (CELLS / 'fork_apply.py').read_text()
+    marker = '_PAYLOAD = None'
+    assert marker in template, 'fork_apply.py template lost its payload marker'
+    src = template.replace(
+        marker,
+        '_PAYLOAD = ' + json.dumps({'commit': commit, 'files': files}),
+        1)
+    print(f'fork_apply cell: vendored {commit[:12]}: {len(files)} files, '
+          f'{len(src) / 1024:.0f} KB source')
+    return src
+
+
 def build_notebook(last_cell='sweep.py'):
     if last_cell == 'prod':
         order = ['header_prod.md', 'setup_prod.py', 'resolve_model.py',
@@ -89,7 +124,10 @@ def build_notebook(last_cell='sweep.py'):
         order = [header, 'setup.py', 'weights.py', 'serve.py', last_cell]
     cells = []
     for n in order:
-        src = (CELLS / n).read_text()
+        if n == 'fork_apply.py':
+            src = fork_apply_cell()
+        else:
+            src = (CELLS / n).read_text()
         cells.append(md_cell(src) if n.endswith('.md') else code_cell(src))
     return json.dumps({
         'metadata': {
