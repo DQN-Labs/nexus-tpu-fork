@@ -6,23 +6,19 @@ import time
 import traceback
 from pathlib import Path
 
-# Apply the fork we built: materialize its Qwen4Exp model tree and register
-# it into the tpu-inference loader, so vLLM resolves Qwen4ExpForCausalLM to
-# OUR JAX implementation instead of failing on unknown architecture.
+# Apply the fork we built: clone + register its Qwen4Exp model into the
+# tpu-inference loader, so vLLM resolves Qwen4ExpForCausalLM to OUR JAX
+# implementation instead of failing on unknown architecture.
 #
-# Sourcing (2026-10-09): the tree is VENDORED into this cell at push time
-# by kaggle_bench.py (base64 payload below) - no `git clone` at runtime.
-# Reason: GitHub began answering anonymous git requests from Kaggle VMs
-# with auth-required (exit 128: "could not read Username for
-# 'https://github.com'"), killing the run with no artifact. Vendoring also
-# removes origin/master drift: the run executes byte-exactly the tree we
-# pushed. If _PAYLOAD is None (standalone/debug use), falls back to the
-# hardened git clone path.
-_PAYLOAD = None  # build_notebook injects {"commit": sha, "files": {...}}
+# Hardened 2026-10-0?: a run died here with no artifact and no visible log
+# (only setup stage files survived), so every failure mode below now
+# (a) retries transient git/network flakes, (b) falls back to a fresh
+# clone when a persisted tree is corrupt, (c) writes fork_error.json with
+# the full traceback + environment fingerprints before re-raising, so the
+# cause is diagnosable from session outputs alone.
 FORK_URL = "https://github.com/DQN-Labs/nexus-tpu-fork.git"
 DST = Path("/kaggle/working/nexus-tpu-fork")
 W = Path("/kaggle/working")
-LEAF = DST / "tpu_inference" / "models" / "jax" / "qwen4_exp"
 
 
 def _run(cmd, timeout_s, attempts=3):
@@ -49,31 +45,7 @@ def _fresh_clone():
          timeout_s=900)
 
 
-def _write_vendored():
-    import base64
-    files = _PAYLOAD["files"]
-    LEAF.mkdir(parents=True, exist_ok=True)
-    total = 0
-    for name in sorted(files):
-        if "/" in name or name.startswith("."):
-            raise RuntimeError(f"bad vendored name: {name!r}")
-        data = base64.b64decode(files[name])
-        (LEAF / name).write_bytes(data)
-        total += len(data)
-    have = sorted(p.name for p in LEAF.glob("*.py"))
-    for need in ("__init__.py", "model.py"):
-        if need not in have:
-            raise RuntimeError(f"vendored leaf missing {need}: {have}")
-    if len(have) < 12:
-        raise RuntimeError(f"vendored leaf too small ({len(have)}): {have}")
-    sha = _PAYLOAD["commit"]
-    (DST / "VENDORED_COMMIT").write_text(sha + "\n")
-    print(f"vendored {sha[:12]}: {len(have)} files, "
-          f"{total / 1024:.0f} KB -> {LEAF}", flush=True)
-    return sha
-
-
-def _clone_git():
+try:
     # Preflight fingerprints (diagnose Kaggle runtime drift: proxy env,
     # git version, disk, and a cheap ls-remote canary before the clone).
     print("git:", subprocess.check_output(
@@ -109,26 +81,14 @@ def _clone_git():
         ["git", "-C", str(DST), "rev-parse", "HEAD"], text=True,
         timeout=60).strip()
     print("fork commit:", sha)
-    return sha
-
-
-sha = None
-vendored = False
-try:
-    if _PAYLOAD:
-        vendored = True
-        sha = _write_vendored()
-    else:
-        print("no vendored payload; using git fallback", flush=True)
-        sha = _clone_git()
-    if not LEAF.is_dir():
+    if not (DST / "tpu_inference" / "models" / "jax" / "qwen4_exp").is_dir():
         raise RuntimeError(
-            f"tree missing qwen4_exp leaf: "
+            f"clone missing qwen4_exp leaf (tree corrupt?): "
             f"{sorted(p.name for p in DST.iterdir())}")
 except Exception:
     (W / "fork_error.json").write_text(__import__("json").dumps(
         {"stage": "git", "error": traceback.format_exc()[-6000:]}, indent=1))
-    print("FORK-APPLY source stage failed; wrote fork_error.json", flush=True)
+    print("FORK-APPLY git stage failed; wrote fork_error.json", flush=True)
     raise
 # Overlay install: our tree ships only the leaf package
 # (tpu_inference/models/jax/qwen4_exp) with no intermediate __init__.py, so
@@ -182,11 +142,11 @@ try:
         assert _c.text_config.hidden_size == 2560
         print("AutoConfig parses qwen4_exp: OK")
     Path("/kaggle/working/fork_applied.json").write_text(__import__("json").dumps(
-        {"commit": sha, "vendored": vendored, "registered": sorted(reg)}))
+        {"commit": sha, "registered": sorted(reg)}))
     print("FORK APPLIED")
 except Exception:
     (W / "fork_error.json").write_text(__import__("json").dumps(
-        {"stage": "overlay-register", "commit": sha, "vendored": vendored,
+        {"stage": "overlay-register", "commit": sha,
          "error": traceback.format_exc()[-6000:]}, indent=1))
     print("FORK-APPLY overlay/register stage failed; wrote fork_error.json",
           flush=True)
